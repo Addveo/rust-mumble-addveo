@@ -238,7 +238,12 @@ impl AnticheatConfig {
             strikes_required: AtomicU32::new(strikes_required.max(1)),
             listen_max: AtomicU32::new(listen_max),
             pos_speed_max: AtomicU32::new(500),
-            pos_jump_max: AtomicU32::new(5),
+            // OFF par défaut : dans FiveM les téléports légitimes (respawn, spawn,
+            // entrée/sortie véhicule, chargement d'interior, changement de bucket)
+            // produisent des "vitesses infinies" et flaggeraient ~tout le serveur.
+            // La position reste capturée + affichée dans le panel (info), mais ne
+            // flag plus. Activable à chaud via le panel (champ "Max téléports").
+            pos_jump_max: AtomicU32::new(0),
             action: AtomicU8::new(action),
             webhook: Mutex::new(webhook.filter(|s| !s.is_empty())),
             panel_url: Mutex::new(panel_url.filter(|s| !s.is_empty())),
