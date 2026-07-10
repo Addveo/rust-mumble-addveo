@@ -41,9 +41,12 @@ pub struct AnticheatStatus {
     pub strikes_required: u32,
     pub listen_max: u32,
     pub action: &'static str,
+    pub webhook: Option<String>,
+    pub panel_url: Option<String>,
     pub connected: u32,
     pub clients: Vec<AnticheatClient>,
     pub logs: Vec<String>,
+    pub bans: Vec<crate::anticheat::BanEntry>,
 }
 
 pub async fn get_anticheat(State(state): State<AppStateRef>) -> Json<AnticheatStatus> {
@@ -84,9 +87,12 @@ pub async fn get_anticheat(State(state): State<AppStateRef>) -> Json<AnticheatSt
         strikes_required: ac.strikes_required.load(Ordering::Relaxed),
         listen_max: ac.listen_max.load(Ordering::Relaxed),
         action: action_name(ac.action.load(Ordering::Relaxed)),
+        webhook: ac.webhook.lock().clone(),
+        panel_url: ac.panel_url.lock().clone(),
         connected: state.server.active_clients.load(Ordering::Relaxed),
         clients,
         logs: ac.recent_logs(),
+        bans: state.server.bans.list(),
     })
 }
 
@@ -100,6 +106,8 @@ pub struct ConfigUpdate {
     pub strikes_required: Option<u32>,
     pub listen_max: Option<u32>,
     pub action: Option<String>,
+    pub webhook: Option<String>,
+    pub panel_url: Option<String>,
 }
 
 pub async fn post_anticheat_config(State(state): State<AppStateRef>, Json(update): Json<ConfigUpdate>) -> StatusCode {
@@ -129,6 +137,12 @@ pub async fn post_anticheat_config(State(state): State<AppStateRef>, Json(update
     if let Some(action) = update.action {
         ac.action.store(parse_action(&action), Ordering::Relaxed);
     }
+    if let Some(w) = update.webhook {
+        *ac.webhook.lock() = if w.trim().is_empty() { None } else { Some(w) };
+    }
+    if let Some(p) = update.panel_url {
+        *ac.panel_url.lock() = if p.trim().is_empty() { None } else { Some(p) };
+    }
 
     tracing::info!(
         "[ANTICHEAT] config updated via api: enabled={}, threshold={}%, min_recipients={}, mutuality_max={}%, window={}s, strikes={}, listen_max={}, action={}",
@@ -157,13 +171,26 @@ pub async fn post_anticheat_user(State(state): State<AppStateRef>, Json(payload)
         return StatusCode::NOT_FOUND;
     };
 
+    let ip = client.peer_ip.to_string();
+    let np = crate::anticheat::name_part(client.get_name().as_str());
+
     match payload.action.as_str() {
         "block" => {
+            // mute PERSISTANT : ajouté à la liste (IP+nom) → re-muté à chaque
+            // reconnexion, donc déco/reco ne l'enlève pas.
             client.ac_exempt.store(false, Ordering::Relaxed);
+            state.server.bans.add(
+                "mute",
+                Some(ip),
+                Some(np),
+                client.get_name().to_string(),
+                "mute manuel".to_string(),
+            );
             client.set_mute(true);
         }
         "unblock" => {
-            // exempt: the automatic action won't re-mute them on the next packet
+            // retire le mute persistant + démute + exempt (l'anticheat auto ne le re-mute pas)
+            state.server.bans.remove_matching(&ip, &np, "mute");
             client.ac_exempt.store(true, Ordering::Relaxed);
             client.set_mute(false);
         }
@@ -179,11 +206,36 @@ pub async fn post_anticheat_user(State(state): State<AppStateRef>, Json(payload)
             client.ac_strikes.store(0, Ordering::Relaxed);
             client.ac_window.lock().clear();
         }
+        "ban" => {
+            // ban par IP + nom, persisté, puis déconnexion. La reconnexion FiveM
+            // sera refusée à l'entrée (cf. tcp.rs).
+            state.server.bans.add(
+                "ban",
+                Some(ip),
+                Some(np),
+                client.get_name().to_string(),
+                "banni via panel".to_string(),
+            );
+            state
+                .server
+                .add_client_to_disconnect_queue(client.session_id, DisconnectReason::Anticheat);
+        }
         _ => return StatusCode::BAD_REQUEST,
     }
 
     tracing::info!("[ANTICHEAT] api action '{}' applied to {}", payload.action, client);
 
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+pub struct Unban {
+    pub id: u64,
+}
+
+pub async fn post_anticheat_unban(State(state): State<AppStateRef>, Json(u): Json<Unban>) -> StatusCode {
+    state.server.bans.remove(u.id);
+    tracing::info!("[ANTICHEAT] unban id={} via api", u.id);
     StatusCode::OK
 }
 
@@ -213,7 +265,11 @@ const PANEL_HTML: &str = r#"<!doctype html>
 </select>
 </label>
 <button onclick="applyConfig()">Appliquer</button>
+<button onclick="resetConfig()">Réinit. défauts</button>
 <span id="confmsg"></span>
+<br>
+<label>Webhook Discord: <input type="text" id="webhook" size="70" placeholder="https://discord.com/api/webhooks/..."></label>
+<label>URL panel (ce serveur): <input type="text" id="panel_url" size="40" placeholder="http://ip:13000/panel"></label>
 </fieldset>
 
 <p>Connect&eacute;s: <b id="connected">?</b> &mdash; mise &agrave; jour auto toutes les 2s</p>
@@ -231,7 +287,12 @@ const PANEL_HTML: &str = r#"<!doctype html>
 
 <div style="width:420px; flex-shrink:0;">
 <b>Logs anticheat</b>
-<pre id="logs" style="height:420px; overflow:auto; border:1px solid #888; padding:6px; margin:4px 0 0; font-size:12px; white-space:pre-wrap;"></pre>
+<pre id="logs" style="height:200px; overflow:auto; border:1px solid #888; padding:6px; margin:4px 0 0; font-size:12px; white-space:pre-wrap;"></pre>
+<b>Bannis</b>
+<table border="1" cellpadding="3" style="width:100%; font-size:12px;">
+<thead><tr><th>Nom</th><th>IP</th><th>Depuis</th><th></th></tr></thead>
+<tbody id="bans"></tbody>
+</table>
 </div>
 
 </div>
@@ -256,6 +317,8 @@ async function load() {
         document.getElementById('strikes_required').value = d.strikes_required;
         document.getElementById('listen_max').value = d.listen_max;
         document.getElementById('action').value = d.action;
+        document.getElementById('webhook').value = d.webhook || '';
+        document.getElementById('panel_url').value = d.panel_url || '';
         firstLoad = false;
     }
 
@@ -272,7 +335,7 @@ async function load() {
             tr.appendChild(td);
         }
         const td = document.createElement('td');
-        for (const [label, action] of [['Bloquer','block'], ['Débloquer','unblock'], ['Kick','kick'], ['Reset','reset']]) {
+        for (const [label, action] of [['Bloquer','block'], ['Débloquer','unblock'], ['Kick','kick'], ['BAN','ban'], ['Reset','reset']]) {
             const b = document.createElement('button');
             b.textContent = label;
             b.onclick = () => userAction(c.name, action);
@@ -284,6 +347,45 @@ async function load() {
 
     document.getElementById('logs').textContent =
         d.logs && d.logs.length ? d.logs.join('\n') : '(aucune détection pour le moment)';
+
+    const bans = document.getElementById('bans');
+    bans.innerHTML = '';
+    for (const b of (d.bans || [])) {
+        const tr = document.createElement('tr');
+        for (const v of [b.display, b.ip || '-', b.at]) {
+            const td = document.createElement('td');
+            td.textContent = v;
+            tr.appendChild(td);
+        }
+        const td = document.createElement('td');
+        const btn = document.createElement('button');
+        btn.textContent = 'Déban';
+        btn.onclick = () => unban(b.id);
+        td.appendChild(btn);
+        tr.appendChild(td);
+        bans.appendChild(tr);
+    }
+}
+
+function resetConfig() {
+    document.getElementById('enabled').checked = true;
+    document.getElementById('threshold_pct').value = 60;
+    document.getElementById('min_recipients').value = 15;
+    document.getElementById('mutuality_max_pct').value = 30;
+    document.getElementById('window_secs').value = 10;
+    document.getElementById('strikes_required').value = 3;
+    document.getElementById('listen_max').value = 25;
+    document.getElementById('action').value = 'log';
+    applyConfig();
+}
+
+async function unban(id) {
+    await fetch('anticheat/unban', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id}),
+    });
+    load();
 }
 
 async function applyConfig() {
@@ -296,6 +398,8 @@ async function applyConfig() {
         strikes_required: parseInt(document.getElementById('strikes_required').value, 10),
         listen_max: parseInt(document.getElementById('listen_max').value, 10),
         action: document.getElementById('action').value,
+        webhook: document.getElementById('webhook').value,
+        panel_url: document.getElementById('panel_url').value,
     };
     const r = await fetch('anticheat/config', {
         method: 'POST',

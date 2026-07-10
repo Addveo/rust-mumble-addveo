@@ -1,13 +1,138 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use scc::ebr::Guard;
+use serde::{Deserialize, Serialize};
 
 use crate::client::ClientArc;
 use crate::error::DisconnectReason;
 use crate::state::{ServerState, ServerStateRef};
+
+/// Une entrée de la liste de bans. On matche par IP OU par nom (partie après
+/// "[id] " du pseudo mumble, car le [id] change à chaque session).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BanEntry {
+    pub id: u64,
+    /// "ban" (refuse la connexion) ou "mute" (mute persistant à chaque connexion).
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    pub ip: Option<String>,
+    pub name: Option<String>,
+    pub display: String,
+    pub reason: String,
+    pub at: String,
+}
+
+fn default_kind() -> String {
+    "ban".to_string()
+}
+
+/// Extrait la partie "nom" du pseudo mumble FiveM : "[36] ReviewB" -> "ReviewB".
+pub fn name_part(username: &str) -> String {
+    match username.find("] ") {
+        Some(pos) => username[pos + 2..].trim().to_string(),
+        None => username.trim().to_string(),
+    }
+}
+
+/// Liste de bans persistée sur disque (JSON). Vérifiée à chaque connexion, donc
+/// une reconnexion FiveM est refusée immédiatement.
+pub struct BanList {
+    bans: Mutex<Vec<BanEntry>>,
+    next_id: AtomicU64,
+    file: Option<PathBuf>,
+}
+
+impl BanList {
+    pub fn load(file: Option<PathBuf>) -> Self {
+        let mut bans = Vec::new();
+        let mut next = 1u64;
+        if let Some(ref f) = file {
+            if let Ok(data) = fs::read_to_string(f) {
+                if let Ok(v) = serde_json::from_str::<Vec<BanEntry>>(&data) {
+                    next = v.iter().map(|b| b.id).max().unwrap_or(0) + 1;
+                    bans = v;
+                }
+            }
+        }
+        tracing::info!("banlist: {} entrée(s) chargée(s)", bans.len());
+        Self {
+            bans: Mutex::new(bans),
+            next_id: AtomicU64::new(next),
+            file,
+        }
+    }
+
+    fn save(&self) {
+        if let Some(ref f) = self.file {
+            let data = serde_json::to_string_pretty(&*self.bans.lock()).unwrap_or_default();
+            if let Err(e) = fs::write(f, data) {
+                tracing::error!("banlist: échec écriture {}: {}", f.display(), e);
+            }
+        }
+    }
+
+    fn matches(entry: &BanEntry, ip: &str, name_part: &str) -> bool {
+        if let Some(ref bip) = entry.ip {
+            if bip == ip {
+                return true;
+            }
+        }
+        if let Some(ref bn) = entry.name {
+            if !bn.is_empty() && bn.eq_ignore_ascii_case(name_part) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Renvoie la raison si (ip, name_part) matche un BAN.
+    pub fn is_banned(&self, ip: &str, name_part: &str) -> Option<String> {
+        let bans = self.bans.lock();
+        bans.iter()
+            .find(|b| b.kind == "ban" && Self::matches(b, ip, name_part))
+            .map(|b| b.reason.clone())
+    }
+
+    /// True si (ip, name_part) matche un MUTE persistant.
+    pub fn is_muted(&self, ip: &str, name_part: &str) -> bool {
+        let bans = self.bans.lock();
+        bans.iter().any(|b| b.kind == "mute" && Self::matches(b, ip, name_part))
+    }
+
+    pub fn add(&self, kind: &str, ip: Option<String>, name: Option<String>, display: String, reason: String) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.bans.lock().push(BanEntry {
+            id,
+            kind: kind.to_string(),
+            ip,
+            name,
+            display,
+            reason,
+            at: hms_now(),
+        });
+        self.save();
+    }
+
+    pub fn remove(&self, id: u64) {
+        self.bans.lock().retain(|b| b.id != id);
+        self.save();
+    }
+
+    /// Retire les entrées d'un `kind` donné qui matchent ce joueur (pour Débloquer).
+    pub fn remove_matching(&self, ip: &str, name_part: &str, kind: &str) {
+        self.bans.lock().retain(|b| !(b.kind == kind && Self::matches(b, ip, name_part)));
+        self.save();
+    }
+
+    pub fn list(&self) -> Vec<BanEntry> {
+        self.bans.lock().clone()
+    }
+}
 
 /// Nombre d'événements anticheat gardés en mémoire pour le panel.
 const LOG_CAPACITY: usize = 100;
@@ -74,6 +199,13 @@ pub struct AnticheatConfig {
     pub listen_max: AtomicU32,
     /// Action sur détection : ACTION_LOG / ACTION_MUTE / ACTION_KICK.
     pub action: AtomicU8,
+    /// URL du webhook Discord (POST à chaque flag). Vide = désactivé.
+    pub webhook: Mutex<Option<String>>,
+    /// URL du panel de CE serveur (ex. http://ip:13000/panel), mise dans l'embed
+    /// Discord pour identifier/ouvrir directement le serveur qui a flaggé.
+    pub panel_url: Mutex<Option<String>>,
+    /// Label du serveur (par défaut l'adresse d'écoute) affiché dans l'embed.
+    pub server_label: String,
     /// Ring buffer des dernières détections (affiché dans le panel).
     logs: Mutex<VecDeque<String>>,
 }
@@ -89,6 +221,9 @@ impl AnticheatConfig {
         strikes_required: u32,
         listen_max: u32,
         action: u8,
+        webhook: Option<String>,
+        panel_url: Option<String>,
+        server_label: String,
     ) -> Self {
         Self {
             enabled: AtomicBool::new(enabled),
@@ -99,6 +234,9 @@ impl AnticheatConfig {
             strikes_required: AtomicU32::new(strikes_required.max(1)),
             listen_max: AtomicU32::new(listen_max),
             action: AtomicU8::new(action),
+            webhook: Mutex::new(webhook.filter(|s| !s.is_empty())),
+            panel_url: Mutex::new(panel_url.filter(|s| !s.is_empty())),
+            server_label,
             logs: Mutex::new(VecDeque::with_capacity(LOG_CAPACITY)),
         }
     }
@@ -344,6 +482,36 @@ impl AnticheatConfig {
             if exempt { "exempt" } else { action_name(action) },
         ));
 
+        // Notification Discord (rate-limitée par client, bien plus espacée que les logs).
+        let webhook = self.webhook.lock().clone();
+        if let Some(url) = webhook {
+            const WEBHOOK_COOLDOWN: Duration = Duration::from_secs(60);
+            if now.duration_since(client.ac_last_webhook.load()) >= WEBHOOK_COOLDOWN {
+                client.ac_last_webhook.store(now);
+                let server_field = match self.panel_url.lock().clone() {
+                    Some(p) => format!("[Ouvrir le panel]({})\n`{}`", p, self.server_label),
+                    None => format!("`{}`", self.server_label),
+                };
+                let payload = serde_json::json!({
+                    "username": "Anticheat Mumble",
+                    "embeds": [{
+                        "title": "🚨 Détection anticheat",
+                        "color": 15158332u32,
+                        "fields": [
+                            {"name": "Joueur", "value": client.get_name().to_string(), "inline": true},
+                            {"name": "IP", "value": client.peer_ip.to_string(), "inline": true},
+                            {"name": "Client", "value": client.version_release.clone(), "inline": true},
+                            {"name": "Raison", "value": reason},
+                            {"name": "Portée / Mutualité", "value": format!("{}/{} joueurs, mut {}", reach, active, mut_s), "inline": true},
+                            {"name": "Listens / Score", "value": format!("{} / {}", listens, score), "inline": true},
+                            {"name": "Serveur", "value": server_field}
+                        ]
+                    }]
+                });
+                post_discord(url, payload);
+            }
+        }
+
         if exempt {
             return;
         }
@@ -354,6 +522,16 @@ impl AnticheatConfig {
             _ => {}
         }
     }
+}
+
+/// POST fire-and-forget vers un webhook Discord (dans un thread bloquant pour
+/// ne jamais impacter la voix). Ignore les erreurs.
+fn post_discord(url: String, payload: serde_json::Value) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = ureq::post(&url).timeout(Duration::from_secs(5)).send_json(payload) {
+            tracing::warn!("[ANTICHEAT] webhook Discord échec: {}", e);
+        }
+    });
 }
 
 /// Boucle d'évaluation périodique, lancée comme tâche au démarrage.

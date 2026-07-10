@@ -1,4 +1,4 @@
-use crate::anticheat::AnticheatConfig;
+use crate::anticheat::{AnticheatConfig, BanList};
 use crate::channel::{Channel, ChannelRef, WeakChannelRef};
 use crate::client::{Client, ClientArc, WeakClient};
 use crate::crypt::CryptState;
@@ -79,6 +79,7 @@ pub struct ServerState {
     channel_count: AtomicU32,
     pub active_clients: AtomicU32,
     pub anticheat: AnticheatConfig,
+    pub bans: BanList,
 }
 
 impl ServerState {
@@ -87,6 +88,7 @@ impl ServerState {
         remove_positional_data: bool,
         restrict_to_version: Option<String>,
         anticheat: AnticheatConfig,
+        bans: BanList,
     ) -> Self {
         let channels = ConcurrentHashMap::new();
         let _ = channels.insert(0, Channel::new(0, Some(0), "Root".to_string(), "Root channel".to_string(), false));
@@ -110,6 +112,7 @@ impl ServerState {
             channel_count: AtomicU32::new(1),
             active_clients: AtomicU32::new(0),
             anticheat,
+            bans,
         }
     }
 

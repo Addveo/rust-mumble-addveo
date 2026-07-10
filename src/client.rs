@@ -98,6 +98,8 @@ pub struct Client {
     pub ac_listen_count: AtomicU32,
     /// Sliding window of recently-targeted ids → last-seen time (for chunking).
     pub ac_window: parking_lot::Mutex<std::collections::HashMap<u64, Instant>>,
+    /// Last Discord webhook post time (rate-limits webhook spam per client).
+    pub ac_last_webhook: AtomicCell<Instant>,
 }
 
 impl Display for Client {
@@ -190,6 +192,7 @@ impl Client {
             ac_strikes: AtomicU32::new(0),
             ac_listen_count: AtomicU32::new(0),
             ac_window: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            ac_last_webhook: AtomicCell::new(Instant::now() - Duration::from_secs(3600)),
         })
     }
 

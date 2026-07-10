@@ -116,6 +116,15 @@ struct Args {
     /// Anticheat: action on detection (log, mute or kick). All settings are also adjustable at runtime via /panel on the admin api.
     #[clap(long, value_parser, default_value = "log")]
     anticheat_action: String,
+    /// Path to a JSON ban file (IP/name bans, persisted across restarts). Mount a volume in prod to survive container recreation.
+    #[clap(long, value_parser, default_value = None)]
+    ban_file: Option<String>,
+    /// Anticheat: Discord webhook URL, posted to on each detection (empty = disabled). Adjustable at runtime via the panel.
+    #[clap(long, value_parser, default_value = None)]
+    anticheat_webhook: Option<String>,
+    /// Anticheat: this server's panel URL (e.g. http://1.2.3.4:13000/panel), put in the Discord embed to identify/open the server that flagged.
+    #[clap(long, value_parser, default_value = None)]
+    anticheat_panel_url: Option<String>,
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -165,6 +174,9 @@ async fn main() {
         args.anticheat_strikes,
         args.anticheat_listen_max,
         crate::anticheat::parse_action(&args.anticheat_action),
+        args.anticheat_webhook.clone(),
+        args.anticheat_panel_url.clone(),
+        args.listen.clone(),
     );
 
     if args.anticheat {
@@ -180,11 +192,14 @@ async fn main() {
         );
     }
 
+    let bans = crate::anticheat::BanList::load(args.ban_file.map(std::path::PathBuf::from));
+
     let state = Arc::new(ServerState::new(
         udp_socket.clone(),
         args.strip_mumble_position,
         args.restrict_to_version,
         anticheat,
+        bans,
     ));
 
     // Tâche d'évaluation anticheat périodique.

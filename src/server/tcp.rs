@@ -156,12 +156,27 @@ async fn handle_new_client(
         }
     }
 
+    // Ban check: refuse la connexion à chaque tentative (le client FiveM
+    // reconnecte instantanément, donc on doit bloquer à l'entrée, pas kicker).
+    let np = crate::anticheat::name_part(&username);
+    if let Some(reason) = state.bans.is_banned(&peer_ip.to_string(), &np) {
+        tracing::warn!("Refused BANNED user '{}' from {} (reason: {})", username, peer_ip, reason);
+        return Err(anyhow::anyhow!("banned: {}", username));
+    }
+
     let (read, write) = io::split(tls_stream);
 
     // we shouldn't really hit a case where this gets hit.
     let (tx, rx) = mpsc::channel(4096);
 
     let client = state.add_client(version, authenticate, crypt_state, write, tx, peer_ip).await;
+
+    // Mute persistant : si ce joueur (IP/nom) est dans la liste des mutes,
+    // on le re-mute direct — déco/reco ne l'enlève pas.
+    if state.bans.is_muted(&peer_ip.to_string(), &np) {
+        client.set_mute(true);
+        tracing::info!("Muted (persistent) client {} from {}", username, peer_ip);
+    }
 
     tracing::info!("TCP new client {} connected {}", username, peer_ip);
 

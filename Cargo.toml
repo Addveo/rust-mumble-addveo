@@ -41,6 +41,7 @@ tokio-util = "0.7.15"
 regex = "1.11.1"
 atomic_float = "1.1.0"
 socket2 = { version = "0.6.0", features = ["all"] }
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 tikv-jemallocator = "0.6"
