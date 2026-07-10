@@ -197,6 +197,10 @@ pub struct AnticheatConfig {
     /// Écouter plus de ce nombre de channels = "listen map-wide" (espionnage
     /// via ChannelListen). 0 = désactive ce détecteur.
     pub listen_max: AtomicU32,
+    /// Vitesse max plausible (m/s) sur un dt court ; au-dessus = téléport (spoof position).
+    pub pos_speed_max: AtomicU32,
+    /// Nombre de téléports impossibles avant de flagger un spoof de position (0 = désactive).
+    pub pos_jump_max: AtomicU32,
     /// Action sur détection : ACTION_LOG / ACTION_MUTE / ACTION_KICK.
     pub action: AtomicU8,
     /// URL du webhook Discord (POST à chaque flag). Vide = désactivé.
@@ -233,6 +237,8 @@ impl AnticheatConfig {
             window_secs: AtomicU32::new(window_secs.max(1)),
             strikes_required: AtomicU32::new(strikes_required.max(1)),
             listen_max: AtomicU32::new(listen_max),
+            pos_speed_max: AtomicU32::new(500),
+            pos_jump_max: AtomicU32::new(5),
             action: AtomicU8::new(action),
             webhook: Mutex::new(webhook.filter(|s| !s.is_empty())),
             panel_url: Mutex::new(panel_url.filter(|s| !s.is_empty())),
@@ -276,6 +282,37 @@ impl AnticheatConfig {
             return;
         }
         client.ac_max_recipients.fetch_max(recipients, Ordering::Relaxed);
+    }
+
+    /// Hot path voix : la position 3D du joueur (si le framework l'envoie).
+    /// Détecte les téléports impossibles (spoof de position) sur des dt courts.
+    pub fn note_position(&self, client: &ClientArc, x: f32, y: f32, z: f32) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = Instant::now();
+        let had = client.ac_has_pos.swap(true, Ordering::Relaxed);
+        if had {
+            let dt = now.duration_since(client.ac_last_pos_time.load()).as_secs_f32();
+            // dt court uniquement : un gros écart = "pas parlé un moment" (ou tp
+            // légitime), pas un spoof. Un spoof cycle sa position à ~50 paquets/s.
+            if dt > 0.0 && dt < 0.5 {
+                let dx = x - client.ac_pos_x.load(Ordering::Relaxed);
+                let dy = y - client.ac_pos_y.load(Ordering::Relaxed);
+                let dz = z - client.ac_pos_z.load(Ordering::Relaxed);
+                let speed = (dx * dx + dy * dy + dz * dz).sqrt() / dt;
+                if speed > client.ac_max_speed.load(Ordering::Relaxed) {
+                    client.ac_max_speed.store(speed, Ordering::Relaxed);
+                }
+                if speed > self.pos_speed_max.load(Ordering::Relaxed) as f32 {
+                    client.ac_pos_jumps.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        client.ac_pos_x.store(x, Ordering::Relaxed);
+        client.ac_pos_y.store(y, Ordering::Relaxed);
+        client.ac_pos_z.store(z, Ordering::Relaxed);
+        client.ac_last_pos_time.store(now);
     }
 
     /// Évaluation périodique de TOUS les clients. Calcule, par client :
@@ -358,6 +395,7 @@ impl AnticheatConfig {
         let mutuality_max = self.mutuality_max_pct.load(Ordering::Relaxed);
         let strikes_required = self.strikes_required.load(Ordering::Relaxed).max(1);
         let listen_max = self.listen_max.load(Ordering::Relaxed);
+        let pos_jump_max = self.pos_jump_max.load(Ordering::Relaxed);
 
         for s in &snaps {
             let c = &s.c;
@@ -415,23 +453,29 @@ impl AnticheatConfig {
             c.ac_listen_count.store(listens, Ordering::Relaxed);
 
             // Conditions de suspicion.
+            let pos_jumps = c.ac_pos_jumps.load(Ordering::Relaxed);
             let high_reach = reach >= min_recipients && (reach as u64) * 100 >= (active as u64) * (threshold_pct as u64);
             let talk_cheat = high_reach && mutuality != 255 && mutuality <= mutuality_max;
             let spy = listen_max > 0 && listens > listen_max;
+            let pos_spoof = pos_jump_max > 0 && pos_jumps > pos_jump_max;
 
-            if talk_cheat || spy {
+            if talk_cheat || spy || pos_spoof {
                 let strikes = c.ac_strikes.fetch_add(1, Ordering::Relaxed) + 1;
                 if strikes >= strikes_required {
-                    let reason = if talk_cheat && spy {
-                        "talk+listen map-wide"
-                    } else if talk_cheat {
-                        "talk map-wide (mutualité faible)"
-                    } else {
-                        "listen map-wide (espionnage)"
-                    };
-                    let metric = if spy && !talk_cheat { listens } else { reach };
+                    let mut parts: Vec<&str> = Vec::new();
+                    if talk_cheat {
+                        parts.push("talk map-wide (mutualité faible)");
+                    }
+                    if spy {
+                        parts.push("listen map-wide (espionnage)");
+                    }
+                    if pos_spoof {
+                        parts.push("spoof position (téléports)");
+                    }
+                    let reason = parts.join(" + ");
+                    let metric = reach.max(listens).max(pos_jumps);
                     c.ac_score.fetch_add(metric as u64, Ordering::Relaxed);
-                    self.flag(state, c, reach, listens, active, mutuality, reason);
+                    self.flag(state, c, reach, listens, active, mutuality, &reason);
                 }
             } else {
                 let cur = c.ac_strikes.load(Ordering::Relaxed);

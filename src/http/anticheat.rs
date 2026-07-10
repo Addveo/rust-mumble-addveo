@@ -25,6 +25,12 @@ pub struct AnticheatClient {
     /// mutuality percent 0-100, or 255 = n/a
     pub mutuality: u32,
     pub listens: u32,
+    pub has_pos: bool,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub pos_jumps: u32,
+    pub max_speed: f32,
     pub score: u64,
     pub flags: u32,
     pub muted: bool,
@@ -40,6 +46,8 @@ pub struct AnticheatStatus {
     pub window_secs: u32,
     pub strikes_required: u32,
     pub listen_max: u32,
+    pub pos_speed_max: u32,
+    pub pos_jump_max: u32,
     pub action: &'static str,
     pub webhook: Option<String>,
     pub panel_url: Option<String>,
@@ -68,6 +76,12 @@ pub async fn get_anticheat(State(state): State<AppStateRef>) -> Json<AnticheatSt
             reach_window: client.ac_reach_window.load(Ordering::Relaxed),
             mutuality: client.ac_mutuality.load(Ordering::Relaxed),
             listens: client.ac_listen_count.load(Ordering::Relaxed),
+            has_pos: client.ac_has_pos.load(Ordering::Relaxed),
+            pos_x: client.ac_pos_x.load(Ordering::Relaxed),
+            pos_y: client.ac_pos_y.load(Ordering::Relaxed),
+            pos_z: client.ac_pos_z.load(Ordering::Relaxed),
+            pos_jumps: client.ac_pos_jumps.load(Ordering::Relaxed),
+            max_speed: client.ac_max_speed.load(Ordering::Relaxed),
             score: client.ac_score.load(Ordering::Relaxed),
             flags: client.ac_flags.load(Ordering::Relaxed),
             muted: client.is_muted(),
@@ -86,6 +100,8 @@ pub async fn get_anticheat(State(state): State<AppStateRef>) -> Json<AnticheatSt
         window_secs: ac.window_secs.load(Ordering::Relaxed),
         strikes_required: ac.strikes_required.load(Ordering::Relaxed),
         listen_max: ac.listen_max.load(Ordering::Relaxed),
+        pos_speed_max: ac.pos_speed_max.load(Ordering::Relaxed),
+        pos_jump_max: ac.pos_jump_max.load(Ordering::Relaxed),
         action: action_name(ac.action.load(Ordering::Relaxed)),
         webhook: ac.webhook.lock().clone(),
         panel_url: ac.panel_url.lock().clone(),
@@ -105,6 +121,8 @@ pub struct ConfigUpdate {
     pub window_secs: Option<u32>,
     pub strikes_required: Option<u32>,
     pub listen_max: Option<u32>,
+    pub pos_speed_max: Option<u32>,
+    pub pos_jump_max: Option<u32>,
     pub action: Option<String>,
     pub webhook: Option<String>,
     pub panel_url: Option<String>,
@@ -133,6 +151,12 @@ pub async fn post_anticheat_config(State(state): State<AppStateRef>, Json(update
     }
     if let Some(l) = update.listen_max {
         ac.listen_max.store(l, Ordering::Relaxed);
+    }
+    if let Some(v) = update.pos_speed_max {
+        ac.pos_speed_max.store(v, Ordering::Relaxed);
+    }
+    if let Some(v) = update.pos_jump_max {
+        ac.pos_jump_max.store(v, Ordering::Relaxed);
     }
     if let Some(action) = update.action {
         ac.action.store(parse_action(&action), Ordering::Relaxed);
@@ -205,6 +229,8 @@ pub async fn post_anticheat_user(State(state): State<AppStateRef>, Json(payload)
             client.ac_max_recipients.store(0, Ordering::Relaxed);
             client.ac_strikes.store(0, Ordering::Relaxed);
             client.ac_window.lock().clear();
+            client.ac_pos_jumps.store(0, Ordering::Relaxed);
+            client.ac_max_speed.store(0.0, Ordering::Relaxed);
         }
         "ban" => {
             // ban par IP + nom, persisté, puis déconnexion. La reconnexion FiveM
@@ -257,6 +283,8 @@ const PANEL_HTML: &str = r#"<!doctype html>
 <label>Fen&ecirc;tre (s): <input type="number" id="window_secs" min="1" size="4"></label>
 <label>Strikes: <input type="number" id="strikes_required" min="1" size="4"></label>
 <label>Max listens: <input type="number" id="listen_max" min="0" size="4"></label>
+<label>Vitesse max (m/s): <input type="number" id="pos_speed_max" min="0" size="5"></label>
+<label>Max t&eacute;l&eacute;ports: <input type="number" id="pos_jump_max" min="0" size="4"></label>
 <label>Action:
 <select id="action">
 <option value="log">log</option>
@@ -279,7 +307,7 @@ const PANEL_HTML: &str = r#"<!doctype html>
 <div style="flex:1; overflow-x:auto;">
 <table border="1" cellpadding="4">
 <thead>
-<tr><th>Session</th><th>Nom</th><th>IP</th><th>Client</th><th>OS</th><th>Chan</th><th>Reach</th><th>Fen&ecirc;tre</th><th>Mutual.</th><th>Listens</th><th>Score</th><th>Flags</th><th>Mut&eacute;</th><th>Exempt</th><th>Actions</th></tr>
+<tr><th>Session</th><th>Nom</th><th>IP</th><th>Client</th><th>Chan</th><th>Reach</th><th>Fen&ecirc;tre</th><th>Mutual.</th><th>Listens</th><th>Position</th><th>V.max</th><th>T&eacute;l&eacute;p.</th><th>Score</th><th>Flags</th><th>Mut&eacute;</th><th>Exempt</th><th>Actions</th></tr>
 </thead>
 <tbody id="clients"></tbody>
 </table>
@@ -316,6 +344,8 @@ async function load() {
         document.getElementById('window_secs').value = d.window_secs;
         document.getElementById('strikes_required').value = d.strikes_required;
         document.getElementById('listen_max').value = d.listen_max;
+        document.getElementById('pos_speed_max').value = d.pos_speed_max;
+        document.getElementById('pos_jump_max').value = d.pos_jump_max;
         document.getElementById('action').value = d.action;
         document.getElementById('webhook').value = d.webhook || '';
         document.getElementById('panel_url').value = d.panel_url || '';
@@ -327,7 +357,9 @@ async function load() {
     for (const c of d.clients) {
         const tr = document.createElement('tr');
         const mut = c.mutuality === 255 ? '-' : (c.mutuality + '%');
-        const cells = [c.session_id, c.name, c.ip, c.release, c.os, c.channel_id, c.reach_instant, c.reach_window, mut, c.listens, c.score, c.flags,
+        const pos = c.has_pos ? (Math.round(c.pos_x) + ',' + Math.round(c.pos_y) + ',' + Math.round(c.pos_z)) : '-';
+        const spd = c.has_pos ? Math.round(c.max_speed) : '-';
+        const cells = [c.session_id, c.name, c.ip, c.release, c.channel_id, c.reach_instant, c.reach_window, mut, c.listens, pos, spd, c.pos_jumps, c.score, c.flags,
                        c.muted ? 'OUI' : 'non', c.exempt ? 'OUI' : 'non'];
         for (const v of cells) {
             const td = document.createElement('td');
@@ -397,6 +429,8 @@ async function applyConfig() {
         window_secs: parseInt(document.getElementById('window_secs').value, 10),
         strikes_required: parseInt(document.getElementById('strikes_required').value, 10),
         listen_max: parseInt(document.getElementById('listen_max').value, 10),
+        pos_speed_max: parseInt(document.getElementById('pos_speed_max').value, 10),
+        pos_jump_max: parseInt(document.getElementById('pos_jump_max').value, 10),
         action: document.getElementById('action').value,
         webhook: document.getElementById('webhook').value,
         panel_url: document.getElementById('panel_url').value,

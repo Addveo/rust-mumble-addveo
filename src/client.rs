@@ -100,6 +100,17 @@ pub struct Client {
     pub ac_window: parking_lot::Mutex<std::collections::HashMap<u64, Instant>>,
     /// Last Discord webhook post time (rate-limits webhook spam per client).
     pub ac_last_webhook: AtomicCell<Instant>,
+    // -- position (audio 3D), pour détecter le spoof (téléports impossibles) --
+    pub ac_pos_x: AtomicF32,
+    pub ac_pos_y: AtomicF32,
+    pub ac_pos_z: AtomicF32,
+    /// A-t-on déjà reçu une position (sinon le framework est en volume-override).
+    pub ac_has_pos: AtomicBool,
+    pub ac_last_pos_time: AtomicCell<Instant>,
+    /// Nombre de sauts de position impossibles (vitesse aberrante sur dt court).
+    pub ac_pos_jumps: AtomicU32,
+    /// Vitesse max observée (m/s) sur des dt courts.
+    pub ac_max_speed: AtomicF32,
 }
 
 impl Display for Client {
@@ -193,6 +204,13 @@ impl Client {
             ac_listen_count: AtomicU32::new(0),
             ac_window: parking_lot::Mutex::new(std::collections::HashMap::new()),
             ac_last_webhook: AtomicCell::new(Instant::now() - Duration::from_secs(3600)),
+            ac_pos_x: AtomicF32::new(0.0),
+            ac_pos_y: AtomicF32::new(0.0),
+            ac_pos_z: AtomicF32::new(0.0),
+            ac_has_pos: AtomicBool::new(false),
+            ac_last_pos_time: AtomicCell::new(Instant::now()),
+            ac_pos_jumps: AtomicU32::new(0),
+            ac_max_speed: AtomicF32::new(0.0),
         })
     }
 

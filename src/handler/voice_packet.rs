@@ -12,6 +12,16 @@ use super::{Handler, MumbleResult};
 // shield your eyes
 impl Handler for VoicePacket<ClientBound> {
     async fn handle(&self, state: &ServerStateRef, client: &ClientArc) -> MumbleResult {
+        // Capture la position 3D (si présente) même pour un client mute → détection de spoof.
+        if let VoicePacket::<ClientBound>::Audio { position_info: Some(pos), .. } = self {
+            if pos.len() >= 12 {
+                let x = f32::from_le_bytes([pos[0], pos[1], pos[2], pos[3]]);
+                let y = f32::from_le_bytes([pos[4], pos[5], pos[6], pos[7]]);
+                let z = f32::from_le_bytes([pos[8], pos[9], pos[10], pos[11]]);
+                state.anticheat.note_position(client, x, y, z);
+            }
+        }
+
         let mute = client.is_muted();
 
         if mute {
