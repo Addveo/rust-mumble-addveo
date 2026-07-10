@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::Html,
 };
@@ -55,6 +55,7 @@ pub struct AnticheatStatus {
     pub pos_far_dist: u32,
     pub pos_far_min: u32,
     pub pos_far_pct: u32,
+    pub heard_secs: u32,
     pub action: &'static str,
     pub webhook: Option<String>,
     pub panel_url: Option<String>,
@@ -113,6 +114,7 @@ pub async fn get_anticheat(State(state): State<AppStateRef>) -> Json<AnticheatSt
         pos_far_dist: ac.pos_far_dist.load(Ordering::Relaxed),
         pos_far_min: ac.pos_far_min.load(Ordering::Relaxed),
         pos_far_pct: ac.pos_far_pct.load(Ordering::Relaxed),
+        heard_secs: ac.heard_secs.load(Ordering::Relaxed),
         action: action_name(ac.action.load(Ordering::Relaxed)),
         webhook: ac.webhook.lock().clone(),
         panel_url: ac.panel_url.lock().clone(),
@@ -137,6 +139,7 @@ pub struct ConfigUpdate {
     pub pos_far_dist: Option<u32>,
     pub pos_far_min: Option<u32>,
     pub pos_far_pct: Option<u32>,
+    pub heard_secs: Option<u32>,
     pub action: Option<String>,
     pub webhook: Option<String>,
     pub panel_url: Option<String>,
@@ -182,6 +185,10 @@ pub async fn post_anticheat_config(State(state): State<AppStateRef>, Json(update
     }
     if let Some(v) = update.pos_far_pct {
         ac.pos_far_pct.store(v.clamp(1, 100), Ordering::Relaxed);
+    }
+    if let Some(v) = update.heard_secs {
+        // 10 s à 2 h : borne la mémoire "qui a parlé" à des valeurs raisonnables.
+        ac.heard_secs.store(v.clamp(10, 7200), Ordering::Relaxed);
     }
     if let Some(action) = update.action {
         ac.action.store(parse_action(&action), Ordering::Relaxed);
@@ -295,6 +302,75 @@ fn reset_client_counters(client: &ClientArc) {
     client.ac_max_speed.store(0.0, Ordering::Relaxed);
     client.ac_pos_hist.lock().clear();
     client.ac_far_targets.store(0, Ordering::Relaxed);
+    client.ac_heard.lock().clear();
+}
+
+#[derive(Serialize)]
+pub struct HeardItem {
+    pub session_id: u32,
+    pub name: String,
+    pub ip: String,
+    /// Secondes écoulées depuis la dernière fois qu'il lui a parlé.
+    pub ago_secs: u64,
+    /// Secondes de parole cumulées (~1 tick/s).
+    pub secs: u32,
+}
+
+#[derive(Serialize)]
+pub struct HeardResponse {
+    pub session_id: u32,
+    pub name: String,
+    pub retention_secs: u32,
+    pub heard: Vec<HeardItem>,
+}
+
+/// QUI a parlé À ce joueur récemment (mémoire `heard_secs`, cap 64 émetteurs).
+/// Les entrées gardent nom + IP même si l'émetteur s'est déconnecté.
+pub async fn get_heard(
+    State(state): State<AppStateRef>,
+    Path(session_id): Path<u32>,
+) -> Result<Json<HeardResponse>, StatusCode> {
+    let Some(entry) = state.server.clients.get_async(&session_id).await else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let client = entry.get();
+    let retention_secs = state.server.anticheat.heard_secs.load(Ordering::Relaxed);
+    let retention = std::time::Duration::from_secs(retention_secs.max(10) as u64);
+    let now = std::time::Instant::now();
+    let mut heard: Vec<HeardItem> = {
+        let mut h = client.ac_heard.lock();
+        h.retain(|_, e| now.duration_since(e.last) <= retention);
+        h.iter()
+            .map(|(&sid, e)| HeardItem {
+                session_id: sid,
+                name: e.name.clone(),
+                ip: e.ip.clone(),
+                ago_secs: now.duration_since(e.last).as_secs(),
+                secs: e.secs,
+            })
+            .collect()
+    };
+    heard.sort_unstable_by_key(|i| i.ago_secs);
+    Ok(Json(HeardResponse {
+        session_id,
+        name: client.get_name().as_ref().clone(),
+        retention_secs,
+        heard,
+    }))
+}
+
+/// Vide la liste « qui lui a parlé » d'un joueur (bouton du panel) — pour
+/// repartir de zéro sur une victime : le prochain émetteur sera le suspect.
+pub async fn post_heard_clear(
+    State(state): State<AppStateRef>,
+    Path(session_id): Path<u32>,
+) -> StatusCode {
+    let Some(entry) = state.server.clients.get_async(&session_id).await else {
+        return StatusCode::NOT_FOUND;
+    };
+    entry.get().ac_heard.lock().clear();
+    tracing::info!("[ANTICHEAT] liste 'qui a parlé' vidée pour la session {} via api", session_id);
+    StatusCode::OK
 }
 
 /// Repart de zéro : compteurs de TOUS les clients + logs du panel — sans
@@ -335,6 +411,7 @@ const PANEL_HTML: &str = r#"<!doctype html>
 <label>Cibles loin min (0=off): <input type="number" id="pos_far_min" min="0" size="4" title="Cibles proximité à position fraîche situées trop loin de l'émetteur (position incohérente)."></label>
 <label>Dist. cibles (m): <input type="number" id="pos_far_dist" min="100" size="5"></label>
 <label>% cibles loin: <input type="number" id="pos_far_pct" min="1" max="100" size="4"></label>
+<label>M&eacute;moire qui-parle (s): <input type="number" id="heard_secs" min="10" max="7200" size="5" title="Dur&eacute;e de r&eacute;tention de la liste 'qui a parl&eacute; &agrave; ce joueur' (clic sur un nom du tableau)."></label>
 <label>Action:
 <select id="action">
 <option value="log">log</option>
@@ -365,6 +442,17 @@ const PANEL_HTML: &str = r#"<!doctype html>
 </div>
 
 <div style="width:420px; flex-shrink:0;">
+<div id="heardbox" style="display:none; margin-bottom:12px; border:2px solid #c60; padding:6px;">
+<b id="heardtitle">-</b>
+<div style="margin:4px 0;">
+<button onclick="clearHeard()" title="Vide la liste : le prochain qui lui parle sera le seul dans la liste — parfait pour identifier un cheater qui recommence.">Vider la liste</button>
+<button onclick="hideHeard()">Fermer</button>
+</div>
+<table border="1" cellpadding="3" style="width:100%; font-size:12px;">
+<thead><tr><th>Session</th><th>Nom</th><th>IP</th><th>Il y a</th><th>Sec. parl&eacute;es</th></tr></thead>
+<tbody id="heard"></tbody>
+</table>
+</div>
 <b>Logs anticheat</b>
 <pre id="logs" style="height:200px; overflow:auto; border:1px solid #888; padding:6px; margin:4px 0 0; font-size:12px; white-space:pre-wrap;"></pre>
 <b>Bannis</b>
@@ -438,11 +526,17 @@ function renderClients() {
         const spd = c.has_pos ? Math.round(c.max_speed) : '-';
         const cells = [c.session_id, c.name, c.ip, c.release, c.channel_id, c.reach_instant, c.reach_window, mut, c.listens, pos, spd, c.pos_jumps, c.far_targets, c.score, c.flags,
                        c.muted ? 'OUI' : 'non', c.exempt ? 'OUI' : 'non'];
-        for (const v of cells) {
+        cells.forEach((v, i) => {
             const td = document.createElement('td');
             td.textContent = v;
+            if (i === 1) {
+                td.style.cursor = 'pointer';
+                td.style.textDecoration = 'underline dotted';
+                td.title = 'Voir qui lui a parlé';
+                td.onclick = () => showHeard(c.session_id, c.name);
+            }
             tr.appendChild(td);
-        }
+        });
         const td = document.createElement('td');
         for (const [label, action] of [['Bloquer','block'], ['Débloquer','unblock'], ['Kick','kick'], ['BAN','ban'], ['Reset','reset']]) {
             const b = document.createElement('button');
@@ -459,6 +553,52 @@ async function clearAll() {
     if (!confirm('Remettre à zéro les scores/flags/compteurs de TOUS les joueurs et vider les logs ?')) return;
     await fetch('anticheat/clear', {method: 'POST'});
     load();
+}
+
+// --- "Qui a parlé à X" : détail par joueur (clic sur un nom du tableau) ---
+let heardSession = null;
+
+function showHeard(sid, name) {
+    heardSession = sid;
+    document.getElementById('heardtitle').textContent = 'Qui a parlé à ' + name + ' ?';
+    document.getElementById('heardbox').style.display = 'block';
+    loadHeard();
+}
+
+function hideHeard() {
+    heardSession = null;
+    document.getElementById('heardbox').style.display = 'none';
+}
+
+async function clearHeard() {
+    if (heardSession === null) return;
+    await fetch('anticheat/heard/' + heardSession + '/clear', {method: 'POST'});
+    loadHeard();
+}
+
+async function loadHeard() {
+    if (heardSession === null) return;
+    const r = await fetch('anticheat/heard/' + heardSession);
+    const tb = document.getElementById('heard');
+    if (!r.ok) {
+        tb.innerHTML = '';
+        document.getElementById('heardtitle').textContent += ' (déconnecté)';
+        heardSession = null;
+        return;
+    }
+    const d = await r.json();
+    document.getElementById('heardtitle').textContent =
+        'Qui a parlé à ' + d.name + ' ? (' + d.heard.length + ' émetteurs, mémoire ' + d.retention_secs + 's)';
+    tb.innerHTML = '';
+    for (const h of d.heard) {
+        const tr = document.createElement('tr');
+        for (const v of [h.session_id, h.name, h.ip, h.ago_secs + 's', h.secs]) {
+            const td = document.createElement('td');
+            td.textContent = v;
+            tr.appendChild(td);
+        }
+        tb.appendChild(tr);
+    }
 }
 
 async function load() {
@@ -482,6 +622,7 @@ async function load() {
         document.getElementById('pos_far_min').value = d.pos_far_min;
         document.getElementById('pos_far_dist').value = d.pos_far_dist;
         document.getElementById('pos_far_pct').value = d.pos_far_pct;
+        document.getElementById('heard_secs').value = d.heard_secs;
         document.getElementById('action').value = d.action;
         document.getElementById('webhook').value = d.webhook || '';
         document.getElementById('panel_url').value = d.panel_url || '';
@@ -490,6 +631,7 @@ async function load() {
 
     lastData = d;
     renderClients();
+    loadHeard();
 
     document.getElementById('logs').textContent =
         d.logs && d.logs.length ? d.logs.join('\n') : '(aucune détection pour le moment)';
@@ -526,6 +668,7 @@ function resetConfig() {
     document.getElementById('pos_far_min').value = 15;
     document.getElementById('pos_far_dist').value = 500;
     document.getElementById('pos_far_pct').value = 70;
+    document.getElementById('heard_secs').value = 900;
     document.getElementById('action').value = 'log';
     applyConfig();
 }
@@ -553,6 +696,7 @@ async function applyConfig() {
         pos_far_min: parseInt(document.getElementById('pos_far_min').value, 10),
         pos_far_dist: parseInt(document.getElementById('pos_far_dist').value, 10),
         pos_far_pct: parseInt(document.getElementById('pos_far_pct').value, 10),
+        heard_secs: parseInt(document.getElementById('heard_secs').value, 10),
         action: document.getElementById('action').value,
         webhook: document.getElementById('webhook').value,
         panel_url: document.getElementById('panel_url').value,

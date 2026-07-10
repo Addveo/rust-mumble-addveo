@@ -115,12 +115,28 @@ impl Handler for VoicePacket<ClientBound> {
             // to the anticheat below to spot map-wide broadcasts.
             let mut recipients: u32 = 0;
 
+            // Mémoire "qui parle à qui" : au plus UNE passe d'enregistrement par
+            // seconde et par émetteur (throttle atomique) — les ~49 autres
+            // paquets/s ne paient que ce load.
+            let record_heard = state.anticheat.enabled.load(Ordering::Relaxed) && {
+                let now = std::time::Instant::now();
+                if now.duration_since(client.ac_last_heard_rec.load()) >= std::time::Duration::from_secs(1) {
+                    client.ac_last_heard_rec.store(now);
+                    true
+                } else {
+                    false
+                }
+            };
+
             let mut iter = listening_clients.first_entry_async().await;
             while let Some(entry) = iter {
                 let cl = entry.get();
                 if let Some(cl) = cl.upgrade() {
                     if !cl.is_deaf() {
                         recipients += 1;
+                        if record_heard {
+                            state.anticheat.note_heard(client, &cl);
+                        }
                         let _ = cl.publisher.try_send(ClientMessage::SendVoicePacket(self.clone())).map_err(|_e| {
                             state.add_client_to_disconnect_queue(cl.session_id, DisconnectReason::ClientMSPCFull);
                         });

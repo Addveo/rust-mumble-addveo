@@ -185,6 +185,21 @@ const POS_HIST_CAP: usize = 16;
 /// plus, il a pu bouger) — utilisée par l'incohérence position↔cibles.
 const POS_FRESH: Duration = Duration::from_secs(10);
 
+/// Cap dur d'émetteurs mémorisés par joueur pour « qui lui a parlé » —
+/// borne stricte de mémoire (~100 octets/entrée → ≤ ~6 Ko par joueur).
+const HEARD_CAP: usize = 64;
+
+/// Une entrée « cet émetteur a parlé à ce joueur » (panel qui-parle-à-qui).
+/// Nom + IP figés à l'enregistrement → survivent à la déco du cheater.
+#[derive(Debug)]
+pub struct HeardEntry {
+    pub name: String,
+    pub ip: String,
+    pub last: Instant,
+    /// Secondes de parole cumulées (1 tick max par seconde, throttle émetteur).
+    pub secs: u32,
+}
+
 pub struct AnticheatConfig {
     pub enabled: AtomicBool,
     /// Un joueur qui atteint plus de ce % des connectés est "haute portée".
@@ -220,6 +235,8 @@ pub struct AnticheatConfig {
     pub pos_far_min: AtomicU32,
     /// Part minimale (%) de cibles lointaines parmi les cibles à position fraîche.
     pub pos_far_pct: AtomicU32,
+    /// Rétention (secondes) de la mémoire « qui a parlé à ce joueur » du panel.
+    pub heard_secs: AtomicU32,
     /// Action sur détection : ACTION_LOG / ACTION_MUTE / ACTION_KICK.
     pub action: AtomicU8,
     /// URL du webhook Discord (POST à chaque flag). Vide = désactivé.
@@ -272,6 +289,9 @@ impl AnticheatConfig {
             pos_far_dist: AtomicU32::new(500),
             pos_far_min: AtomicU32::new(15),
             pos_far_pct: AtomicU32::new(70),
+            // 15 min : assez pour qu'un streamer signale le harcèlement après
+            // coup ; la RAM reste bornée par HEARD_CAP, pas par la durée.
+            heard_secs: AtomicU32::new(900),
             action: AtomicU8::new(action),
             webhook: Mutex::new(webhook.filter(|s| !s.is_empty())),
             panel_url: Mutex::new(panel_url.filter(|s| !s.is_empty())),
@@ -320,6 +340,34 @@ impl AnticheatConfig {
             return;
         }
         client.ac_max_recipients.fetch_max(recipients, Ordering::Relaxed);
+    }
+
+    /// Marque « speaker a parlé à listener » (mémoire du panel qui-parle-à-qui).
+    /// Appelé depuis le hot path voix AU PLUS 1×/seconde par émetteur (throttle
+    /// côté émetteur dans voice_packet.rs) : un upsert derrière un lock
+    /// par-destinataire, quelques dizaines de ns — invisible face au routage.
+    /// Si l'émetteur reparle, seule l'heure (et le cumul) est mise à jour.
+    pub fn note_heard(&self, speaker: &ClientArc, listener: &ClientArc) {
+        let now = Instant::now();
+        let mut heard = listener.ac_heard.lock();
+        if heard.len() >= HEARD_CAP {
+            let retention = Duration::from_secs(self.heard_secs.load(Ordering::Relaxed).max(10) as u64);
+            heard.retain(|_, e| now.duration_since(e.last) <= retention);
+            if heard.len() >= HEARD_CAP {
+                // Toujours plein d'entrées récentes : on évince la plus ancienne.
+                if let Some(k) = heard.iter().min_by_key(|(_, e)| e.last).map(|(&k, _)| k) {
+                    heard.remove(&k);
+                }
+            }
+        }
+        let e = heard.entry(speaker.session_id).or_insert_with(|| HeardEntry {
+            name: speaker.get_name().to_string(),
+            ip: speaker.peer_ip.to_string(),
+            last: now,
+            secs: 0,
+        });
+        e.last = now;
+        e.secs += 1;
     }
 
     /// Hot path voix : la position 3D du joueur (si le framework l'envoie).

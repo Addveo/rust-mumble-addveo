@@ -118,6 +118,13 @@ pub struct Client {
     /// Cibles proximité (channels) à position fraîche situées trop loin de soi
     /// au dernier échantillon (position incohérente).
     pub ac_far_targets: AtomicU32,
+    /// QUI a parlé À ce client récemment : session émetteur → entrée (nom, ip,
+    /// dernier instant, secondes cumulées). Alimenté au plus 1×/s par émetteur
+    /// (throttle ac_last_heard_rec), purgé à 5 min. Sert au panel "qui lui a
+    /// parlé" (harcèlement ciblé de streamers) — survit à la déco du cheater.
+    pub ac_heard: parking_lot::Mutex<std::collections::HashMap<u32, crate::anticheat::HeardEntry>>,
+    /// Throttle émetteur (1 s) pour l'enregistrement "qui parle à qui".
+    pub ac_last_heard_rec: AtomicCell<Instant>,
 }
 
 impl Display for Client {
@@ -220,6 +227,8 @@ impl Client {
             ac_max_speed: AtomicF32::new(0.0),
             ac_pos_hist: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             ac_far_targets: AtomicU32::new(0),
+            ac_heard: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            ac_last_heard_rec: AtomicCell::new(Instant::now() - Duration::from_secs(3600)),
         })
     }
 
