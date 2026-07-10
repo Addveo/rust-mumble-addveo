@@ -523,7 +523,7 @@ function resetConfig() {
     document.getElementById('listen_max').value = 25;
     document.getElementById('pos_osc_max').value = 0;
     document.getElementById('pos_osc_dist').value = 300;
-    document.getElementById('pos_far_min').value = 10;
+    document.getElementById('pos_far_min').value = 15;
     document.getElementById('pos_far_dist').value = 500;
     document.getElementById('pos_far_pct').value = 70;
     document.getElementById('action').value = 'log';

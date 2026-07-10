@@ -264,11 +264,13 @@ impl AnticheatConfig {
             // Incohérence position↔cibles ON par défaut : triple garde (cibles
             // proximité uniquement, positions fraîches, mutualité basse exigée)
             // → une foule, un respawn ou le téléphone ne peuvent pas la déclencher.
-            // min à 10 : un spectate staff ou une course de refresh post-téléport
-            // peut atteindre ~6 cibles lointaines transitoires (vu sur Fratworld
-            // 2026-07-10, joueur légitime) ; un vrai cheat map-wide en a 100+.
+            // min à 15 (= min_recipients) : un spectate staff plafonne à ~6 cibles
+            // lointaines, un staff en rondes (tp de groupe en groupe en parlant) à
+            // ~12 (vus en prod le 2026-07-10, tous légitimes) ; un cheat map-wide
+            // en a 100+. Même plancher que le talk map-wide : sous 15 destinataires,
+            // on ne flag pas.
             pos_far_dist: AtomicU32::new(500),
-            pos_far_min: AtomicU32::new(10),
+            pos_far_min: AtomicU32::new(15),
             pos_far_pct: AtomicU32::new(70),
             action: AtomicU8::new(action),
             webhook: Mutex::new(webhook.filter(|s| !s.is_empty())),
