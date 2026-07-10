@@ -316,9 +316,10 @@ impl AnticheatConfig {
             pos_far_dist: AtomicU32::new(500),
             pos_far_min: AtomicU32::new(15),
             pos_far_pct: AtomicU32::new(70),
-            // 15 min : assez pour qu'un streamer signale le harcèlement après
-            // coup ; la RAM reste bornée par HEARD_CAP, pas par la durée.
-            heard_secs: AtomicU32::new(900),
+            // 1 h : large pour qu'un streamer signale le harcèlement après coup.
+            // La RAM reste bornée par HEARD_CAP (64 émetteurs/joueur), pas par
+            // la durée — seule la taille du snapshot JSON varie (négligeable).
+            heard_secs: AtomicU32::new(3600),
             heard_file: Mutex::new(None),
             heard_seed: Mutex::new(HashMap::new()),
             action: AtomicU8::new(action),

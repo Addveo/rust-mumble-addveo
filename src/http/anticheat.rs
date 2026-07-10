@@ -406,6 +406,8 @@ fieldset { flex: 0 0 auto; }
 #tablewrap table { border-collapse: collapse; width: 100%; font-size: 13px; }
 #tablewrap thead th { position: sticky; top: 0; background: #e8e8e8; z-index: 1; box-shadow: 0 1px 0 #888; }
 #right { width: 440px; flex: 0 0 auto; overflow-y: auto; min-height: 0; }
+#heardwrap { max-height: 260px; overflow: auto; }
+#heardwrap thead th { position: sticky; top: 0; background: #e8e8e8; box-shadow: 0 1px 0 #888; }
 @media (max-width: 1100px) {
   body { overflow: auto; }
   #main { flex-direction: column; }
@@ -475,10 +477,12 @@ fieldset { flex: 0 0 auto; }
 <button onclick="clearHeard()" title="Vide la liste : le prochain qui lui parle sera le seul dans la liste — parfait pour identifier un cheater qui recommence.">Vider la liste</button>
 <button onclick="hideHeard()">Fermer</button>
 </div>
-<table border="1" cellpadding="3" style="width:100%; font-size:12px;">
+<div id="heardwrap">
+<table border="1" cellpadding="3" style="width:100%; font-size:12px; border-collapse:collapse;">
 <thead><tr><th>Session</th><th>Nom</th><th>IP</th><th>Il y a</th><th>Sec. parl&eacute;es</th></tr></thead>
 <tbody id="heard"></tbody>
 </table>
+</div>
 </div>
 <b>Logs anticheat</b>
 <pre id="logs" style="height:200px; overflow:auto; border:1px solid #888; padding:6px; margin:4px 0 0; font-size:12px; white-space:pre-wrap;"></pre>
@@ -724,7 +728,7 @@ function resetConfig() {
     document.getElementById('pos_far_min').value = 15;
     document.getElementById('pos_far_dist').value = 500;
     document.getElementById('pos_far_pct').value = 70;
-    document.getElementById('heard_secs').value = 900;
+    document.getElementById('heard_secs').value = 3600;
     document.getElementById('action').value = 'log';
     applyConfig();
 }
