@@ -13,6 +13,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 #[macro_use]
 extern crate lazy_static;
 
+mod anticheat;
 mod channel;
 mod check;
 mod clean;
@@ -89,6 +90,22 @@ struct Args {
     /// clients with the CitizenFX mumble client to join.
     #[clap(short, long, value_parser, default_value = None)]
     restrict_to_version: Option<String>,
+    /// Enable the built-in anticheat: flags clients whose voice reaches an
+    /// abnormal share of connected players (map-wide broadcast cheats).
+    #[clap(long)]
+    anticheat: bool,
+    /// Anticheat: flag a transmission reaching more than this percentage of connected players (1-100)
+    #[clap(long, value_parser, default_value_t = 50)]
+    anticheat_threshold_pct: u32,
+    /// Anticheat: never flag a transmission reaching fewer recipients than this (protects low-population servers)
+    #[clap(long, value_parser, default_value_t = 15)]
+    anticheat_min_recipients: u32,
+    /// Anticheat: flag a client registering a voice target with more individual sessions than this
+    #[clap(long, value_parser, default_value_t = 40)]
+    anticheat_max_target_sessions: u32,
+    /// Anticheat: action on detection (log, mute or kick). All settings are also adjustable at runtime via /panel on the admin api.
+    #[clap(long, value_parser, default_value = "log")]
+    anticheat_action: String,
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -129,10 +146,29 @@ async fn main() {
 
     let udp_socket = Arc::new(socket);
 
+    let anticheat = crate::anticheat::AnticheatConfig::new(
+        args.anticheat,
+        args.anticheat_threshold_pct,
+        args.anticheat_min_recipients,
+        args.anticheat_max_target_sessions,
+        crate::anticheat::parse_action(&args.anticheat_action),
+    );
+
+    if args.anticheat {
+        tracing::info!(
+            "anticheat enabled: threshold {}% of connected players (min {} recipients), max {} sessions per voice target, action={}",
+            args.anticheat_threshold_pct,
+            args.anticheat_min_recipients,
+            args.anticheat_max_target_sessions,
+            crate::anticheat::action_name(crate::anticheat::parse_action(&args.anticheat_action)),
+        );
+    }
+
     let state = Arc::new(ServerState::new(
         udp_socket.clone(),
         args.strip_mumble_position,
         args.restrict_to_version,
+        anticheat,
     ));
     let udp_state = state.clone();
 

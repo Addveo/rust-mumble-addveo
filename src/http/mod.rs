@@ -1,3 +1,4 @@
+mod anticheat;
 mod axum_auth_wrapper;
 mod deaf;
 mod metrics;
@@ -11,6 +12,7 @@ use axum::{
     middleware::from_fn_with_state,
     routing::{get, post},
 };
+use anticheat::{get_anticheat, get_panel, post_anticheat_config, post_anticheat_user};
 use axum_auth_wrapper::auth_basic;
 use deaf::{get_deaf, post_deaf};
 use metrics::get_metrics;
@@ -41,11 +43,15 @@ pub fn create_http_server(state: ServerStateRef, username: String, password: Opt
 
     Some(
         Router::new()
+            .route("/anticheat", get(get_anticheat))
+            .route("/anticheat/config", post(post_anticheat_config))
+            .route("/anticheat/user", post(post_anticheat_user))
             .route("/deaf", post(post_deaf))
             .route("/deaf/:player_id", get(get_deaf))
             .route("/metrics", get(get_metrics))
             .route("/mute", post(post_mute))
             .route("/mute/:player_id", get(get_mute))
+            .route("/panel", get(get_panel))
             .route("/status", get(get_status))
             .route_layer(from_fn_with_state(app_state.clone(), auth_basic))
             .with_state(app_state),

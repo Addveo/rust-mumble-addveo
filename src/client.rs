@@ -14,8 +14,8 @@ use crossbeam::atomic::AtomicCell;
 use protobuf::Message;
 use scc::ebr::Guard;
 use std::fmt::Display;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWriteExt, WriteHalf};
@@ -66,6 +66,26 @@ pub struct Client {
     pub last_udp_ping: AtomicCell<Instant>,
     // the amount of bad tcp messages the client has sent, after 20 the client will be dropped automatically
     pub bad_net_count: AtomicU32,
+    // -- identity (captured at connection, for the admin panel / anticheat) --
+    /// Remote IP the client connected from (TCP peer).
+    pub peer_ip: IpAddr,
+    /// Client release name, e.g. "CitizenFX" (in-game) vs a raw Mumble client — key anticheat signal.
+    pub version_release: String,
+    /// Client version formatted major.minor.patch.
+    pub version_str: String,
+    /// Client OS reported at handshake.
+    pub version_os: String,
+    // -- anticheat stats (RAM only, reset on reconnect) --
+    /// Cumulative recipients of over-threshold transmissions; a map-wide talker piles this up fast.
+    pub ac_score: AtomicU64,
+    /// Highest recipient count seen in a single transmission.
+    pub ac_max_recipients: AtomicU32,
+    /// Number of times this client got flagged.
+    pub ac_flags: AtomicU32,
+    /// Last flag time, used to rate-limit logs/actions.
+    pub ac_last_flag: AtomicCell<Instant>,
+    /// Exempt from automatic actions (set from the admin panel: "unblock").
+    pub ac_exempt: AtomicBool,
 }
 
 impl Display for Client {
@@ -108,7 +128,7 @@ impl Client {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        _version: Version,
+        version: Version,
         authenticate: Authenticate,
         session_id: u32,
         channel_id: u32,
@@ -116,12 +136,18 @@ impl Client {
         write: WriteHalf<TlsStream<TcpStream>>,
         udp_socket: Arc<UdpSocket>,
         publisher: Sender<ClientMessage>,
+        peer_ip: IpAddr,
     ) -> Arc<Self> {
         // let tokens = authenticate.get_tokens().iter().map(|token| token.to_string()).collect();
         let targets: VoiceTargetArray = core::array::from_fn(|_v| Arc::new(VoiceTarget::default()));
 
+        let ver = version.get_version();
+
         Arc::new(Self {
-            // version,
+            peer_ip,
+            version_release: version.get_release().to_string(),
+            version_str: format!("{}.{}.{}", ver >> 16, (ver >> 8) & 0xff, ver & 0xff),
+            version_os: version.get_os().to_string(),
             session_id,
             log_name: Arc::new(format!("{} [session id: {}]", authenticate.get_username(), session_id)),
             net_stats: Default::default(),
@@ -141,6 +167,11 @@ impl Client {
             last_tcp_ping: AtomicCell::new(Instant::now()),
             last_udp_ping: AtomicCell::new(Instant::now()),
             bad_net_count: AtomicU32::new(0),
+            ac_score: AtomicU64::new(0),
+            ac_max_recipients: AtomicU32::new(0),
+            ac_flags: AtomicU32::new(0),
+            ac_last_flag: AtomicCell::new(Instant::now()),
+            ac_exempt: AtomicBool::new(false),
         })
     }
 

@@ -101,11 +101,16 @@ impl Handler for VoicePacket<ClientBound> {
             // remove the calling client from the session list so we don't have to branch here.
             listening_clients.remove_async(session_id).await;
 
+            // count actual recipients while sending (no extra iteration) — fed
+            // to the anticheat below to spot map-wide broadcasts.
+            let mut recipients: u32 = 0;
+
             let mut iter = listening_clients.first_entry_async().await;
             while let Some(entry) = iter {
                 let cl = entry.get();
                 if let Some(cl) = cl.upgrade() {
                     if !cl.is_deaf() {
+                        recipients += 1;
                         let _ = cl.publisher.try_send(ClientMessage::SendVoicePacket(self.clone())).map_err(|_e| {
                             state.add_client_to_disconnect_queue(cl.session_id, DisconnectReason::ClientMSPCFull);
                         });
@@ -113,6 +118,8 @@ impl Handler for VoicePacket<ClientBound> {
                 }
                 iter = entry.next_async().await;
             }
+
+            state.anticheat.observe_emission(state, client, recipients);
         }
 
         Ok(())

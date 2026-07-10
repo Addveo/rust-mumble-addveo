@@ -56,4 +56,6 @@ pub enum DisconnectReason {
     LostReceivingChannel,
     #[error("Client Message Channel Full")]
     ClientMSPCFull,
+    #[error("Kicked by anticheat: voice reached an abnormal share of connected players")]
+    Anticheat,
 }

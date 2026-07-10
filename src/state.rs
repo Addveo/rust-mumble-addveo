@@ -1,3 +1,4 @@
+use crate::anticheat::AnticheatConfig;
 use crate::channel::{Channel, ChannelRef, WeakChannelRef};
 use crate::client::{Client, ClientArc, WeakClient};
 use crate::crypt::CryptState;
@@ -77,10 +78,16 @@ pub struct ServerState {
     session_count: AtomicU32,
     channel_count: AtomicU32,
     pub active_clients: AtomicU32,
+    pub anticheat: AnticheatConfig,
 }
 
 impl ServerState {
-    pub fn new(socket: Arc<UdpSocket>, remove_positional_data: bool, restrict_to_version: Option<String>) -> Self {
+    pub fn new(
+        socket: Arc<UdpSocket>,
+        remove_positional_data: bool,
+        restrict_to_version: Option<String>,
+        anticheat: AnticheatConfig,
+    ) -> Self {
         let channels = ConcurrentHashMap::new();
         let _ = channels.insert(0, Channel::new(0, Some(0), "Root".to_string(), "Root channel".to_string(), false));
 
@@ -102,6 +109,7 @@ impl ServerState {
             session_count: AtomicU32::new(1),
             channel_count: AtomicU32::new(1),
             active_clients: AtomicU32::new(0),
+            anticheat,
         }
     }
 
@@ -112,7 +120,7 @@ impl ServerState {
         crypt_state: CryptState,
         write: WriteHalf<TlsStream<TcpStream>>,
         publisher: Sender<ClientMessage>,
-        _peer_ip: IpAddr,
+        peer_ip: IpAddr,
     ) -> ClientArc {
         let session_id = self.get_free_session_id();
 
@@ -125,6 +133,7 @@ impl ServerState {
             write,
             Arc::clone(&self.socket),
             publisher,
+            peer_ip,
         );
 
         crate::metrics::CLIENTS_TOTAL.inc();
