@@ -395,6 +395,24 @@ pub async fn get_panel() -> Html<&'static str> {
 const PANEL_HTML: &str = r#"<!doctype html>
 <html lang="fr">
 <body>
+<style>
+html, body { height: 100%; margin: 0; }
+body { display: flex; flex-direction: column; overflow: hidden; box-sizing: border-box; padding: 8px; gap: 6px; font-family: sans-serif; }
+fieldset { flex: 0 0 auto; }
+#controls { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+#main { display: flex; gap: 14px; flex: 1 1 auto; min-height: 0; }
+#left { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+#tablewrap { flex: 1 1 auto; overflow: auto; min-height: 0; border: 1px solid #888; }
+#tablewrap table { border-collapse: collapse; width: 100%; font-size: 13px; }
+#tablewrap thead th { position: sticky; top: 0; background: #e8e8e8; z-index: 1; box-shadow: 0 1px 0 #888; }
+#right { width: 440px; flex: 0 0 auto; overflow-y: auto; min-height: 0; }
+@media (max-width: 1100px) {
+  body { overflow: auto; }
+  #main { flex-direction: column; }
+  #right { width: auto; }
+  #tablewrap { max-height: 60vh; }
+}
+</style>
 
 <fieldset>
 <legend>Configuration</legend>
@@ -428,11 +446,19 @@ const PANEL_HTML: &str = r#"<!doctype html>
 <label>URL panel (ce serveur): <input type="text" id="panel_url" size="40" placeholder="http://ip:13000/panel"></label>
 </fieldset>
 
-<p>Connect&eacute;s: <b id="connected">?</b> &mdash; mise &agrave; jour auto toutes les 2s</p>
+<div id="controls">
+<span>Connect&eacute;s: <b id="connected">?</b></span>
+<input type="text" id="search" size="30" placeholder="Filtrer (nom, IP, session)..." oninput="onSearch(this.value)">
+<button onclick="prevPage()">&laquo; Pr&eacute;c.</button>
+<span id="pageinfo"></span>
+<button onclick="nextPage()">Suiv. &raquo;</button>
+<span style="font-size:12px; color:#666;">maj auto 2s</span>
+</div>
 
-<div style="display:flex; gap:16px; align-items:flex-start;">
+<div id="main">
 
-<div style="flex:1; overflow-x:auto;">
+<div id="left">
+<div id="tablewrap">
 <table border="1" cellpadding="4">
 <thead>
 <tr id="headrow"></tr>
@@ -440,8 +466,9 @@ const PANEL_HTML: &str = r#"<!doctype html>
 <tbody id="clients"></tbody>
 </table>
 </div>
+</div>
 
-<div style="width:420px; flex-shrink:0;">
+<div id="right">
 <div id="heardbox" style="display:none; margin-bottom:12px; border:2px solid #c60; padding:6px;">
 <b id="heardtitle">-</b>
 <div style="margin:4px 0;">
@@ -489,6 +516,18 @@ const COLS = [
     {k:null, l:'Actions'},
 ];
 let sortKey = 'score', sortDir = -1, lastData = null;
+let searchQ = '';
+let page = 0;
+const PAGE_SIZE = 100;
+
+function onSearch(v) {
+    searchQ = v.trim().toLowerCase();
+    page = 0;
+    renderClients();
+}
+
+function prevPage() { if (page > 0) { page--; renderClients(); } }
+function nextPage() { page++; renderClients(); } // clampé dans renderClients
 
 function buildHead() {
     const tr = document.getElementById('headrow');
@@ -511,15 +550,32 @@ function buildHead() {
 
 function renderClients() {
     if (!lastData) return;
-    const clients = lastData.clients.slice().sort((a, b) => {
+    let clients = lastData.clients;
+    if (searchQ) {
+        clients = clients.filter((c) =>
+            c.name.toLowerCase().includes(searchQ) ||
+            c.ip.includes(searchQ) ||
+            String(c.session_id).includes(searchQ));
+    }
+    clients = clients.slice().sort((a, b) => {
         let va = a[sortKey], vb = b[sortKey];
         if (sortKey === 'mutuality') { if (va === 255) va = -1; if (vb === 255) vb = -1; }
         if (typeof va === 'string') return va.localeCompare(vb) * sortDir;
         return ((va > vb) - (va < vb)) * sortDir;
     });
+    // Pagination : 100 lignes max dans le DOM (des serveurs à 2000 joueurs
+    // rameraient sinon), le tri/filtre s'appliquent sur la liste complète.
+    const pages = Math.max(1, Math.ceil(clients.length / PAGE_SIZE));
+    if (page >= pages) page = pages - 1;
+    if (page < 0) page = 0;
+    const shown = clients.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+    document.getElementById('pageinfo').textContent =
+        'page ' + (page + 1) + '/' + pages +
+        (searchQ ? ' — ' + clients.length + ' filtrés' : '') +
+        ' — ' + shown.length + '/' + lastData.clients.length + ' affichés';
     const tbody = document.getElementById('clients');
     tbody.innerHTML = '';
-    for (const c of clients) {
+    for (const c of shown) {
         const tr = document.createElement('tr');
         const mut = c.mutuality === 255 ? '-' : (c.mutuality + '%');
         const pos = c.has_pos ? (Math.round(c.pos_x) + ',' + Math.round(c.pos_y) + ',' + Math.round(c.pos_z)) : '-';
