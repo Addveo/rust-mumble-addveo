@@ -119,7 +119,7 @@ impl Handler for VoicePacket<ClientBound> {
                 iter = entry.next_async().await;
             }
 
-            state.anticheat.observe_emission(state, client, recipients);
+            state.anticheat.note_emission(client, recipients);
         }
 
         Ok(())

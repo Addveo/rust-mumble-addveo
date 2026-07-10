@@ -86,6 +86,18 @@ pub struct Client {
     pub ac_last_flag: AtomicCell<Instant>,
     /// Exempt from automatic actions (set from the admin panel: "unblock").
     pub ac_exempt: AtomicBool,
+    /// Players reached by the current voice target (resolved, snapshot).
+    pub ac_reach_instant: AtomicU32,
+    /// Distinct targets over the sliding window (chunking signal).
+    pub ac_reach_window: AtomicU32,
+    /// Mutuality percent 0-100 of the current reached set (255 = n/a).
+    pub ac_mutuality: AtomicU32,
+    /// Consecutive suspicious samples (debounce before acting).
+    pub ac_strikes: AtomicU32,
+    /// Number of channels this client listens to (map-wide spy signal).
+    pub ac_listen_count: AtomicU32,
+    /// Sliding window of recently-targeted ids → last-seen time (for chunking).
+    pub ac_window: parking_lot::Mutex<std::collections::HashMap<u64, Instant>>,
 }
 
 impl Display for Client {
@@ -172,6 +184,12 @@ impl Client {
             ac_flags: AtomicU32::new(0),
             ac_last_flag: AtomicCell::new(Instant::now()),
             ac_exempt: AtomicBool::new(false),
+            ac_reach_instant: AtomicU32::new(0),
+            ac_reach_window: AtomicU32::new(0),
+            ac_mutuality: AtomicU32::new(255),
+            ac_strikes: AtomicU32::new(0),
+            ac_listen_count: AtomicU32::new(0),
+            ac_window: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
     }
 

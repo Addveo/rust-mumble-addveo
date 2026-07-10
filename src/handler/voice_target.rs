@@ -33,29 +33,28 @@ impl Handler for VoiceTarget {
         target.sessions.clear_async().await;
         target.channels.clear_async().await;
 
-        // Count every addressable target in the registration. In pma-voice each
-        // player sits in their OWN channel, so proximity builds the target from
-        // CHANNELS (one per nearby player) while radio/phone use SESSIONS. A
-        // legit target holds a handful (nearby players / call / radio group); a
-        // map-wide cheat registers everyone's channel (or session). Counting
-        // channels + sessions is therefore ~= the number of players reached.
-        let mut target_count: u32 = 0;
+        // In pma-voice each player sits in their OWN channel, so proximity builds
+        // the target from CHANNELS (one per nearby player) while radio/phone use
+        // SESSIONS. We feed every addressable target into the anticheat sliding
+        // window so it can spot both map-wide broadcasts and chunking (cycling
+        // through target sets), whatever the mix of channels vs sessions.
+        let mut keys: Vec<u64> = Vec::new();
 
         for target_item in self.get_targets() {
             for session in target_item.get_session() {
                 // we clear this above, we won't run into duplicate inserts.
                 let _ = target.sessions.insert_async(*session, ()).await;
-                target_count += 1;
+                keys.push(crate::anticheat::key_session(*session));
             }
 
             if target_item.has_channel_id() {
                 // we clear this above, we won't run into duplicate inserts.
                 let _ = target.channels.insert_async(target_item.get_channel_id(), ()).await;
-                target_count += 1;
+                keys.push(crate::anticheat::key_channel(target_item.get_channel_id()));
             }
         }
 
-        state.anticheat.observe_target_registration(state, client, target_count);
+        state.anticheat.record_targets(client, &keys);
 
         Ok(())
     }

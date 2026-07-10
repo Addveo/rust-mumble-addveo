@@ -91,18 +91,28 @@ struct Args {
     #[clap(short, long, value_parser, default_value = None)]
     restrict_to_version: Option<String>,
     /// Enable the built-in anticheat: flags clients whose voice reaches an
-    /// abnormal share of connected players (map-wide broadcast cheats).
+    /// abnormal share of players with low mutuality (map-wide broadcast/chunking
+    /// cheats) or who listen to too many channels (map-wide spying).
     #[clap(long)]
     anticheat: bool,
-    /// Anticheat: flag a transmission reaching more than this percentage of connected players (1-100)
-    #[clap(long, value_parser, default_value_t = 50)]
+    /// Anticheat: "high reach" = reaching more than this percentage of connected players (1-100)
+    #[clap(long, value_parser, default_value_t = 60)]
     anticheat_threshold_pct: u32,
-    /// Anticheat: never flag a transmission reaching fewer recipients than this (protects low-population servers)
+    /// Anticheat: never flag reaching fewer players than this (protects low-population servers)
     #[clap(long, value_parser, default_value_t = 15)]
     anticheat_min_recipients: u32,
-    /// Anticheat: flag a client registering a voice target with more individual sessions than this
-    #[clap(long, value_parser, default_value_t = 40)]
-    anticheat_max_target_sessions: u32,
+    /// Anticheat: high reach + mutuality BELOW this % = cheat (a legit crowd is mutual, a cheater is not)
+    #[clap(long, value_parser, default_value_t = 30)]
+    anticheat_mutuality_max_pct: u32,
+    /// Anticheat: sliding window (seconds) for counting distinct targets (chunking detection)
+    #[clap(long, value_parser, default_value_t = 10)]
+    anticheat_window_secs: u32,
+    /// Anticheat: consecutive suspicious samples before acting (debounce)
+    #[clap(long, value_parser, default_value_t = 3)]
+    anticheat_strikes: u32,
+    /// Anticheat: listening to more than this many channels = map-wide spying (0 disables)
+    #[clap(long, value_parser, default_value_t = 25)]
+    anticheat_listen_max: u32,
     /// Anticheat: action on detection (log, mute or kick). All settings are also adjustable at runtime via /panel on the admin api.
     #[clap(long, value_parser, default_value = "log")]
     anticheat_action: String,
@@ -150,16 +160,22 @@ async fn main() {
         args.anticheat,
         args.anticheat_threshold_pct,
         args.anticheat_min_recipients,
-        args.anticheat_max_target_sessions,
+        args.anticheat_mutuality_max_pct,
+        args.anticheat_window_secs,
+        args.anticheat_strikes,
+        args.anticheat_listen_max,
         crate::anticheat::parse_action(&args.anticheat_action),
     );
 
     if args.anticheat {
         tracing::info!(
-            "anticheat enabled: threshold {}% of connected players (min {} recipients), max {} sessions per voice target, action={}",
+            "anticheat enabled: high reach >{}% (min {}), mutuality <{}% = cheat, window {}s, {} strikes, listen_max {}, action={}",
             args.anticheat_threshold_pct,
             args.anticheat_min_recipients,
-            args.anticheat_max_target_sessions,
+            args.anticheat_mutuality_max_pct,
+            args.anticheat_window_secs,
+            args.anticheat_strikes,
+            args.anticheat_listen_max,
             crate::anticheat::action_name(crate::anticheat::parse_action(&args.anticheat_action)),
         );
     }
@@ -170,6 +186,12 @@ async fn main() {
         args.restrict_to_version,
         anticheat,
     ));
+
+    // Tâche d'évaluation anticheat périodique.
+    let anticheat_state = state.clone();
+    set.spawn(async move {
+        crate::anticheat::run_sampler(anticheat_state).await;
+    });
     let udp_state = state.clone();
 
     tracing::info!("tcp/udp server start listening on {}", args.listen);
