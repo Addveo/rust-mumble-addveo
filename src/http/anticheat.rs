@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 
 use super::AppStateRef;
 use crate::anticheat::{action_name, parse_action};
+use crate::client::ClientArc;
 use crate::error::DisconnectReason;
 
 #[derive(Serialize)]
@@ -248,13 +249,7 @@ pub async fn post_anticheat_user(State(state): State<AppStateRef>, Json(payload)
                 .add_client_to_disconnect_queue(client.session_id, DisconnectReason::Anticheat);
         }
         "reset" => {
-            client.ac_score.store(0, Ordering::Relaxed);
-            client.ac_flags.store(0, Ordering::Relaxed);
-            client.ac_max_recipients.store(0, Ordering::Relaxed);
-            client.ac_strikes.store(0, Ordering::Relaxed);
-            client.ac_window.lock().clear();
-            client.ac_pos_jumps.store(0, Ordering::Relaxed);
-            client.ac_max_speed.store(0.0, Ordering::Relaxed);
+            reset_client_counters(&client);
         }
         "ban" => {
             // ban par IP + nom, persisté, puis déconnexion. La reconnexion FiveM
@@ -286,6 +281,34 @@ pub struct Unban {
 pub async fn post_anticheat_unban(State(state): State<AppStateRef>, Json(u): Json<Unban>) -> StatusCode {
     state.server.bans.remove(u.id);
     tracing::info!("[ANTICHEAT] unban id={} via api", u.id);
+    StatusCode::OK
+}
+
+/// Remet à zéro les compteurs anticheat d'UN client (bouton Reset + clear global).
+fn reset_client_counters(client: &ClientArc) {
+    client.ac_score.store(0, Ordering::Relaxed);
+    client.ac_flags.store(0, Ordering::Relaxed);
+    client.ac_max_recipients.store(0, Ordering::Relaxed);
+    client.ac_strikes.store(0, Ordering::Relaxed);
+    client.ac_window.lock().clear();
+    client.ac_pos_jumps.store(0, Ordering::Relaxed);
+    client.ac_max_speed.store(0.0, Ordering::Relaxed);
+    client.ac_pos_hist.lock().clear();
+    client.ac_far_targets.store(0, Ordering::Relaxed);
+}
+
+/// Repart de zéro : compteurs de TOUS les clients + logs du panel — sans
+/// recréer le conteneur. Ne touche NI la config NI la liste de bans/mutes.
+pub async fn post_anticheat_clear(State(state): State<AppStateRef>) -> StatusCode {
+    let mut n = 0u32;
+    let mut iter = state.server.clients.first_entry_async().await;
+    while let Some(entry) = iter {
+        reset_client_counters(entry.get());
+        n += 1;
+        iter = entry.next_async().await;
+    }
+    state.server.anticheat.clear_logs();
+    tracing::info!("[ANTICHEAT] clear global via api : compteurs de {} clients + logs remis à zéro", n);
     StatusCode::OK
 }
 
@@ -321,6 +344,7 @@ const PANEL_HTML: &str = r#"<!doctype html>
 </label>
 <button onclick="applyConfig()">Appliquer</button>
 <button onclick="resetConfig()">Réinit. défauts</button>
+<button onclick="clearAll()" title="Remet à zéro scores/flags/strikes/compteurs de tous les joueurs et vide les logs. Ne touche ni la config ni les bans.">Clear compteurs/logs</button>
 <span id="confmsg"></span>
 <br>
 <label>Webhook Discord: <input type="text" id="webhook" size="70" placeholder="https://discord.com/api/webhooks/..."></label>
@@ -334,7 +358,7 @@ const PANEL_HTML: &str = r#"<!doctype html>
 <div style="flex:1; overflow-x:auto;">
 <table border="1" cellpadding="4">
 <thead>
-<tr><th>Session</th><th>Nom</th><th>IP</th><th>Client</th><th>Chan</th><th>Reach</th><th>Fen&ecirc;tre</th><th>Mutual.</th><th>Listens</th><th>Position</th><th>V.max</th><th>Oscill.</th><th>Loin</th><th>Score</th><th>Flags</th><th>Mut&eacute;</th><th>Exempt</th><th>Actions</th></tr>
+<tr id="headrow"></tr>
 </thead>
 <tbody id="clients"></tbody>
 </table>
@@ -354,6 +378,88 @@ const PANEL_HTML: &str = r#"<!doctype html>
 
 <script>
 let firstLoad = true;
+
+// Colonnes du tableau : k = clé JSON triable (null = non triable).
+const COLS = [
+    {k:'session_id', l:'Session'},
+    {k:'name', l:'Nom'},
+    {k:'ip', l:'IP'},
+    {k:'release', l:'Client'},
+    {k:'channel_id', l:'Chan'},
+    {k:'reach_instant', l:'Reach'},
+    {k:'reach_window', l:'Fenêtre'},
+    {k:'mutuality', l:'Mutual.'},
+    {k:'listens', l:'Listens'},
+    {k:null, l:'Position'},
+    {k:'max_speed', l:'V.max'},
+    {k:'pos_jumps', l:'Oscill.'},
+    {k:'far_targets', l:'Loin'},
+    {k:'score', l:'Score'},
+    {k:'flags', l:'Flags'},
+    {k:'muted', l:'Muté'},
+    {k:'exempt', l:'Exempt'},
+    {k:null, l:'Actions'},
+];
+let sortKey = 'score', sortDir = -1, lastData = null;
+
+function buildHead() {
+    const tr = document.getElementById('headrow');
+    tr.innerHTML = '';
+    for (const col of COLS) {
+        const th = document.createElement('th');
+        th.textContent = col.l + (col.k === sortKey ? (sortDir < 0 ? ' ▼' : ' ▲') : '');
+        if (col.k) {
+            th.style.cursor = 'pointer';
+            th.title = 'Trier par ' + col.l;
+            th.onclick = () => {
+                if (sortKey === col.k) { sortDir = -sortDir; } else { sortKey = col.k; sortDir = -1; }
+                buildHead();
+                renderClients();
+            };
+        }
+        tr.appendChild(th);
+    }
+}
+
+function renderClients() {
+    if (!lastData) return;
+    const clients = lastData.clients.slice().sort((a, b) => {
+        let va = a[sortKey], vb = b[sortKey];
+        if (sortKey === 'mutuality') { if (va === 255) va = -1; if (vb === 255) vb = -1; }
+        if (typeof va === 'string') return va.localeCompare(vb) * sortDir;
+        return ((va > vb) - (va < vb)) * sortDir;
+    });
+    const tbody = document.getElementById('clients');
+    tbody.innerHTML = '';
+    for (const c of clients) {
+        const tr = document.createElement('tr');
+        const mut = c.mutuality === 255 ? '-' : (c.mutuality + '%');
+        const pos = c.has_pos ? (Math.round(c.pos_x) + ',' + Math.round(c.pos_y) + ',' + Math.round(c.pos_z)) : '-';
+        const spd = c.has_pos ? Math.round(c.max_speed) : '-';
+        const cells = [c.session_id, c.name, c.ip, c.release, c.channel_id, c.reach_instant, c.reach_window, mut, c.listens, pos, spd, c.pos_jumps, c.far_targets, c.score, c.flags,
+                       c.muted ? 'OUI' : 'non', c.exempt ? 'OUI' : 'non'];
+        for (const v of cells) {
+            const td = document.createElement('td');
+            td.textContent = v;
+            tr.appendChild(td);
+        }
+        const td = document.createElement('td');
+        for (const [label, action] of [['Bloquer','block'], ['Débloquer','unblock'], ['Kick','kick'], ['BAN','ban'], ['Reset','reset']]) {
+            const b = document.createElement('button');
+            b.textContent = label;
+            b.onclick = () => userAction(c.name, action);
+            td.appendChild(b);
+        }
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+    }
+}
+
+async function clearAll() {
+    if (!confirm('Remettre à zéro les scores/flags/compteurs de TOUS les joueurs et vider les logs ?')) return;
+    await fetch('anticheat/clear', {method: 'POST'});
+    load();
+}
 
 async function load() {
     const r = await fetch('anticheat');
@@ -382,30 +488,8 @@ async function load() {
         firstLoad = false;
     }
 
-    const tbody = document.getElementById('clients');
-    tbody.innerHTML = '';
-    for (const c of d.clients) {
-        const tr = document.createElement('tr');
-        const mut = c.mutuality === 255 ? '-' : (c.mutuality + '%');
-        const pos = c.has_pos ? (Math.round(c.pos_x) + ',' + Math.round(c.pos_y) + ',' + Math.round(c.pos_z)) : '-';
-        const spd = c.has_pos ? Math.round(c.max_speed) : '-';
-        const cells = [c.session_id, c.name, c.ip, c.release, c.channel_id, c.reach_instant, c.reach_window, mut, c.listens, pos, spd, c.pos_jumps, c.far_targets, c.score, c.flags,
-                       c.muted ? 'OUI' : 'non', c.exempt ? 'OUI' : 'non'];
-        for (const v of cells) {
-            const td = document.createElement('td');
-            td.textContent = v;
-            tr.appendChild(td);
-        }
-        const td = document.createElement('td');
-        for (const [label, action] of [['Bloquer','block'], ['Débloquer','unblock'], ['Kick','kick'], ['BAN','ban'], ['Reset','reset']]) {
-            const b = document.createElement('button');
-            b.textContent = label;
-            b.onclick = () => userAction(c.name, action);
-            td.appendChild(b);
-        }
-        tr.appendChild(td);
-        tbody.appendChild(tr);
-    }
+    lastData = d;
+    renderClients();
 
     document.getElementById('logs').textContent =
         d.logs && d.logs.length ? d.logs.join('\n') : '(aucune détection pour le moment)';
@@ -491,6 +575,7 @@ async function userAction(user, action) {
     load();
 }
 
+buildHead();
 load();
 setInterval(load, 2000);
 </script>

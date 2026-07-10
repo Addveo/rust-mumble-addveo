@@ -280,6 +280,11 @@ impl AnticheatConfig {
         self.logs.lock().iter().rev().cloned().collect()
     }
 
+    /// Vide le ring buffer de logs (bouton "clear" du panel).
+    pub fn clear_logs(&self) {
+        self.logs.lock().clear();
+    }
+
     fn push_log(&self, line: String) {
         let mut logs = self.logs.lock();
         if logs.len() >= LOG_CAPACITY {

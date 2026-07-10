@@ -12,7 +12,7 @@ use axum::{
     middleware::from_fn_with_state,
     routing::{get, post},
 };
-use anticheat::{get_anticheat, get_panel, post_anticheat_config, post_anticheat_unban, post_anticheat_user};
+use anticheat::{get_anticheat, get_panel, post_anticheat_clear, post_anticheat_config, post_anticheat_unban, post_anticheat_user};
 use axum_auth_wrapper::auth_basic;
 use deaf::{get_deaf, post_deaf};
 use metrics::get_metrics;
@@ -44,6 +44,7 @@ pub fn create_http_server(state: ServerStateRef, username: String, password: Opt
     Some(
         Router::new()
             .route("/anticheat", get(get_anticheat))
+            .route("/anticheat/clear", post(post_anticheat_clear))
             .route("/anticheat/config", post(post_anticheat_config))
             .route("/anticheat/user", post(post_anticheat_user))
             .route("/anticheat/unban", post(post_anticheat_unban))
