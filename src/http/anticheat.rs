@@ -340,9 +340,9 @@ pub async fn get_heard(
     let mut heard: Vec<HeardItem> = {
         let mut h = client.ac_heard.lock();
         h.retain(|_, e| now.duration_since(e.last) <= retention);
-        h.iter()
-            .map(|(&sid, e)| HeardItem {
-                session_id: sid,
+        h.values()
+            .map(|e| HeardItem {
+                session_id: e.session_id,
                 name: e.name.clone(),
                 ip: e.ip.clone(),
                 ago_secs: now.duration_since(e.last).as_secs(),

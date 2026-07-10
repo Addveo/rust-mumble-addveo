@@ -188,17 +188,39 @@ const POS_FRESH: Duration = Duration::from_secs(10);
 /// Cap dur d'émetteurs mémorisés par joueur pour « qui lui a parlé » —
 /// borne stricte de mémoire (~100 octets/entrée → ≤ ~6 Ko par joueur).
 const HEARD_CAP: usize = 64;
+/// Snapshot disque de la mémoire « qui a parlé » tous les N cycles du sampler
+/// (30 × 2 s = 60 s) — jamais sur le chemin voix.
+const HEARD_FLUSH_EVERY: u32 = 30;
 
 /// Une entrée « cet émetteur a parlé à ce joueur » (panel qui-parle-à-qui).
-/// Nom + IP figés à l'enregistrement → survivent à la déco du cheater.
+/// Clé de la map = nom (partie après "[id] ") → un cheater qui déco/reco ne
+/// crée pas de doublon, sa ligne est juste remise à jour. Nom + IP figés →
+/// survivent à sa déconnexion.
 #[derive(Debug)]
 pub struct HeardEntry {
+    /// Dernière session connue de l'émetteur (info panel).
+    pub session_id: u32,
     pub name: String,
     pub ip: String,
     pub last: Instant,
     /// Secondes de parole cumulées (1 tick max par seconde, throttle émetteur).
     pub secs: u32,
 }
+
+/// Version sérialisée d'une HeardEntry pour le snapshot /data/heard.json
+/// (Instant → epoch pour survivre aux restarts du conteneur).
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedHeardEntry {
+    session_id: u32,
+    name: String,
+    ip: String,
+    /// Epoch (secondes) de la dernière parole.
+    epoch: u64,
+    secs: u32,
+}
+
+/// Format du fichier : nom du joueur écouté → (nom émetteur → entrée).
+type PersistedHeard = HashMap<String, HashMap<String, PersistedHeardEntry>>;
 
 pub struct AnticheatConfig {
     pub enabled: AtomicBool,
@@ -237,6 +259,11 @@ pub struct AnticheatConfig {
     pub pos_far_pct: AtomicU32,
     /// Rétention (secondes) de la mémoire « qui a parlé à ce joueur » du panel.
     pub heard_secs: AtomicU32,
+    /// Fichier de persistance de « qui a parlé » (snapshot 60 s, volume /data).
+    pub heard_file: Mutex<Option<PathBuf>>,
+    /// Listes rechargées du disque, en attente de la reconnexion de leur
+    /// propriétaire (clé = nom du joueur écouté).
+    heard_seed: Mutex<PersistedHeard>,
     /// Action sur détection : ACTION_LOG / ACTION_MUTE / ACTION_KICK.
     pub action: AtomicU8,
     /// URL du webhook Discord (POST à chaque flag). Vide = désactivé.
@@ -292,6 +319,8 @@ impl AnticheatConfig {
             // 15 min : assez pour qu'un streamer signale le harcèlement après
             // coup ; la RAM reste bornée par HEARD_CAP, pas par la durée.
             heard_secs: AtomicU32::new(900),
+            heard_file: Mutex::new(None),
+            heard_seed: Mutex::new(HashMap::new()),
             action: AtomicU8::new(action),
             webhook: Mutex::new(webhook.filter(|s| !s.is_empty())),
             panel_url: Mutex::new(panel_url.filter(|s| !s.is_empty())),
@@ -349,25 +378,83 @@ impl AnticheatConfig {
     /// Si l'émetteur reparle, seule l'heure (et le cumul) est mise à jour.
     pub fn note_heard(&self, speaker: &ClientArc, listener: &ClientArc) {
         let now = Instant::now();
+        let key = name_part(speaker.get_name().as_str());
         let mut heard = listener.ac_heard.lock();
-        if heard.len() >= HEARD_CAP {
+        if heard.len() >= HEARD_CAP && !heard.contains_key(&key) {
             let retention = Duration::from_secs(self.heard_secs.load(Ordering::Relaxed).max(10) as u64);
             heard.retain(|_, e| now.duration_since(e.last) <= retention);
             if heard.len() >= HEARD_CAP {
                 // Toujours plein d'entrées récentes : on évince la plus ancienne.
-                if let Some(k) = heard.iter().min_by_key(|(_, e)| e.last).map(|(&k, _)| k) {
+                if let Some(k) = heard.iter().min_by_key(|(_, e)| e.last).map(|(k, _)| k.clone()) {
                     heard.remove(&k);
                 }
             }
         }
-        let e = heard.entry(speaker.session_id).or_insert_with(|| HeardEntry {
+        let e = heard.entry(key).or_insert_with(|| HeardEntry {
+            session_id: speaker.session_id,
             name: speaker.get_name().to_string(),
             ip: speaker.peer_ip.to_string(),
             last: now,
             secs: 0,
         });
+        if e.session_id != speaker.session_id {
+            // L'émetteur s'est reconnecté : on rafraîchit session/nom/IP (pas
+            // de doublon, la ligne est juste mise à jour).
+            e.session_id = speaker.session_id;
+            e.name = speaker.get_name().to_string();
+            e.ip = speaker.peer_ip.to_string();
+        }
         e.last = now;
         e.secs += 1;
+    }
+
+    /// Configure la persistance « qui a parlé » et recharge le snapshot disque
+    /// (survit aux restarts/recréations du conteneur, comme bans.json).
+    pub fn init_heard_persistence(&self, path: PathBuf) {
+        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let retention = self.heard_secs.load(Ordering::Relaxed).max(10) as u64;
+        match fs::read_to_string(&path) {
+            Ok(data) => match serde_json::from_str::<PersistedHeard>(&data) {
+                Ok(mut seed) => {
+                    // Purge ce qui a expiré pendant l'arrêt.
+                    for lists in seed.values_mut() {
+                        lists.retain(|_, e| now_epoch.saturating_sub(e.epoch) <= retention);
+                    }
+                    seed.retain(|_, l| !l.is_empty());
+                    let n: usize = seed.values().map(|l| l.len()).sum();
+                    tracing::info!(
+                        "[ANTICHEAT] mémoire 'qui a parlé' rechargée depuis {} : {} joueurs, {} entrées",
+                        path.display(), seed.len(), n,
+                    );
+                    *self.heard_seed.lock() = seed;
+                }
+                Err(e) => tracing::warn!("[ANTICHEAT] heard file illisible ({}) : {}", path.display(), e),
+            },
+            // Pas encore de fichier : normal au premier démarrage.
+            Err(_) => {}
+        }
+        *self.heard_file.lock() = Some(path);
+    }
+
+    /// À la connexion d'un client : réinjecte sa liste « qui lui a parlé »
+    /// depuis le snapshot disque.
+    pub fn seed_heard(&self, client: &ClientArc) {
+        let key = name_part(client.get_name().as_str());
+        let Some(entries) = self.heard_seed.lock().remove(&key) else { return };
+        let now = Instant::now();
+        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut heard = client.ac_heard.lock();
+        for (speaker, e) in entries {
+            let ago = now_epoch.saturating_sub(e.epoch);
+            let last = now.checked_sub(Duration::from_secs(ago)).unwrap_or(now);
+            heard.entry(speaker).or_insert(HeardEntry {
+                session_id: e.session_id,
+                name: e.name,
+                ip: e.ip,
+                last,
+                secs: e.secs,
+            });
+        }
     }
 
     /// Hot path voix : la position 3D du joueur (si le framework l'envoie).
@@ -770,8 +857,73 @@ fn post_discord(url: String, payload: serde_json::Value) {
 
 /// Boucle d'évaluation périodique, lancée comme tâche au démarrage.
 pub async fn run_sampler(state: ServerStateRef) {
+    let mut ticks: u32 = 0;
     loop {
         tokio::time::sleep(SAMPLE_INTERVAL).await;
         state.anticheat.sample(&state).await;
+        ticks = ticks.wrapping_add(1);
+        if ticks % HEARD_FLUSH_EVERY == 0 {
+            flush_heard(&state).await;
+        }
+    }
+}
+
+/// Snapshot JSON de toutes les listes « qui a parlé » vers le volume /data —
+/// hors du chemin voix (sampler), écrit en .tmp puis rename (atomique). Les
+/// listes des joueurs pas encore reconnectés (seed) sont conservées.
+async fn flush_heard(state: &ServerStateRef) {
+    let Some(path) = state.anticheat.heard_file.lock().clone() else { return };
+    if !state.anticheat.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    let retention = state.anticheat.heard_secs.load(Ordering::Relaxed).max(10) as u64;
+    let now = Instant::now();
+    let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+
+    let mut out: PersistedHeard = HashMap::new();
+    {
+        let mut it = state.clients.first_entry_async().await;
+        while let Some(e) = it {
+            let c = e.get();
+            let lists: HashMap<String, PersistedHeardEntry> = {
+                let h = c.ac_heard.lock();
+                h.iter()
+                    .filter(|(_, en)| now.duration_since(en.last).as_secs() <= retention)
+                    .map(|(k, en)| {
+                        (
+                            k.clone(),
+                            PersistedHeardEntry {
+                                session_id: en.session_id,
+                                name: en.name.clone(),
+                                ip: en.ip.clone(),
+                                epoch: now_epoch.saturating_sub(now.duration_since(en.last).as_secs()),
+                                secs: en.secs,
+                            },
+                        )
+                    })
+                    .collect()
+            };
+            if !lists.is_empty() {
+                out.insert(name_part(c.get_name().as_str()), lists);
+            }
+            it = e.next_async().await;
+        }
+    }
+    {
+        // Les listes rechargées dont le propriétaire n'est pas revenu restent
+        // persistées (elles expireront via la rétention).
+        let seed = state.anticheat.heard_seed.lock();
+        for (k, v) in seed.iter() {
+            out.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    match serde_json::to_vec(&out) {
+        Ok(json) => {
+            let tmp = path.with_extension("tmp");
+            if let Err(e) = fs::write(&tmp, &json).and_then(|_| fs::rename(&tmp, &path)) {
+                tracing::warn!("[ANTICHEAT] échec écriture {} : {}", path.display(), e);
+            }
+        }
+        Err(e) => tracing::warn!("[ANTICHEAT] échec sérialisation heard : {}", e),
     }
 }

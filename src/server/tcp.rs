@@ -178,6 +178,10 @@ async fn handle_new_client(
         tracing::info!("Muted (persistent) client {} from {}", username, peer_ip);
     }
 
+    // Réinjecte sa liste « qui lui a parlé » depuis le snapshot disque
+    // (survit aux restarts/recréations du conteneur).
+    state.anticheat.seed_heard(&client);
+
     tracing::info!("TCP new client {} connected {}", username, peer_ip);
 
     let state_cl = state.clone();

@@ -192,7 +192,19 @@ async fn main() {
         );
     }
 
-    let bans = crate::anticheat::BanList::load(args.ban_file.map(std::path::PathBuf::from));
+    let bans = crate::anticheat::BanList::load(args.ban_file.clone().map(std::path::PathBuf::from));
+
+    // Persistance « qui a parlé » : heard.json à côté du ban file (volume
+    // /data en prod) — snapshot 60 s + rechargement au démarrage.
+    if args.anticheat {
+        if let Some(bf) = args.ban_file.as_ref() {
+            let dir = std::path::Path::new(bf)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default();
+            anticheat.init_heard_persistence(dir.join("heard.json"));
+        }
+    }
 
     let state = Arc::new(ServerState::new(
         udp_socket.clone(),
