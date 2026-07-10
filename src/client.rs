@@ -100,17 +100,24 @@ pub struct Client {
     pub ac_window: parking_lot::Mutex<std::collections::HashMap<u64, Instant>>,
     /// Last Discord webhook post time (rate-limits webhook spam per client).
     pub ac_last_webhook: AtomicCell<Instant>,
-    // -- position (audio 3D), pour détecter le spoof (téléports impossibles) --
+    // -- position (audio 3D), pour détecter le spoof (multi-positions) --
     pub ac_pos_x: AtomicF32,
     pub ac_pos_y: AtomicF32,
     pub ac_pos_z: AtomicF32,
     /// A-t-on déjà reçu une position (sinon le framework est en volume-override).
     pub ac_has_pos: AtomicBool,
     pub ac_last_pos_time: AtomicCell<Instant>,
-    /// Nombre de sauts de position impossibles (vitesse aberrante sur dt court).
+    /// Nombre de RETOURS (oscillations A→B→A) vers un lieu antérieur lointain
+    /// dans la fenêtre — un tp légitime (respawn/interior) = 1 saut, 0 retour.
     pub ac_pos_jumps: AtomicU32,
-    /// Vitesse max observée (m/s) sur des dt courts.
+    /// Vitesse max observée (m/s) sur des dt courts (info panel uniquement).
     pub ac_max_speed: AtomicF32,
+    /// Historique des "lieux" récents (ancres espacées de pos_osc_dist) :
+    /// (instant, x, y, z, est_un_retour).
+    pub ac_pos_hist: parking_lot::Mutex<std::collections::VecDeque<(Instant, f32, f32, f32, bool)>>,
+    /// Cibles proximité (channels) à position fraîche situées trop loin de soi
+    /// au dernier échantillon (position incohérente).
+    pub ac_far_targets: AtomicU32,
 }
 
 impl Display for Client {
@@ -211,6 +218,8 @@ impl Client {
             ac_last_pos_time: AtomicCell::new(Instant::now()),
             ac_pos_jumps: AtomicU32::new(0),
             ac_max_speed: AtomicF32::new(0.0),
+            ac_pos_hist: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            ac_far_targets: AtomicU32::new(0),
         })
     }
 

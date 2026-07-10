@@ -177,6 +177,14 @@ pub fn action_name(action: u8) -> &'static str {
 
 /// Configuration anticheat, réglable à chaud via l'API HTTP. Tous les champs
 /// sont atomiques : le hot path voix ne prend jamais de lock.
+/// Fenêtre d'observation des oscillations de position (retours A→B→A).
+const POS_OSC_WINDOW: Duration = Duration::from_secs(30);
+/// Taille max de l'historique de lieux par client.
+const POS_HIST_CAP: usize = 16;
+/// Une position plus vieille que ça n'est plus comparable (le joueur n'émet
+/// plus, il a pu bouger) — utilisée par l'incohérence position↔cibles.
+const POS_FRESH: Duration = Duration::from_secs(10);
+
 pub struct AnticheatConfig {
     pub enabled: AtomicBool,
     /// Un joueur qui atteint plus de ce % des connectés est "haute portée".
@@ -197,10 +205,21 @@ pub struct AnticheatConfig {
     /// Écouter plus de ce nombre de channels = "listen map-wide" (espionnage
     /// via ChannelListen). 0 = désactive ce détecteur.
     pub listen_max: AtomicU32,
-    /// Vitesse max plausible (m/s) sur un dt court ; au-dessus = téléport (spoof position).
-    pub pos_speed_max: AtomicU32,
-    /// Nombre de téléports impossibles avant de flagger un spoof de position (0 = désactive).
-    pub pos_jump_max: AtomicU32,
+    /// Distance (m) séparant deux "lieux" distincts pour le suivi d'oscillation
+    /// (et rayon de retour = moitié). 0 = ne suit plus les lieux du tout.
+    pub pos_osc_dist: AtomicU32,
+    /// Nombre de RETOURS vers un lieu antérieur (A→B→A…) dans la fenêtre avant
+    /// de flagger un spoof multi-positions. 0 = détection off (suivi affiché
+    /// quand même). Un tp légitime (respawn, interior, bucket) = 0 retour.
+    pub pos_osc_max: AtomicU32,
+    /// Distance (m) au-delà de laquelle une cible PROXIMITÉ (channel) est
+    /// "hors de portée" de la position déclarée de l'émetteur.
+    pub pos_far_dist: AtomicU32,
+    /// Minimum de cibles proximité lointaines (à position fraîche) pour flagger
+    /// une incohérence position/cibles. 0 = détection off (compte affiché).
+    pub pos_far_min: AtomicU32,
+    /// Part minimale (%) de cibles lointaines parmi les cibles à position fraîche.
+    pub pos_far_pct: AtomicU32,
     /// Action sur détection : ACTION_LOG / ACTION_MUTE / ACTION_KICK.
     pub action: AtomicU8,
     /// URL du webhook Discord (POST à chaque flag). Vide = désactivé.
@@ -237,13 +256,17 @@ impl AnticheatConfig {
             window_secs: AtomicU32::new(window_secs.max(1)),
             strikes_required: AtomicU32::new(strikes_required.max(1)),
             listen_max: AtomicU32::new(listen_max),
-            pos_speed_max: AtomicU32::new(500),
-            // OFF par défaut : dans FiveM les téléports légitimes (respawn, spawn,
-            // entrée/sortie véhicule, chargement d'interior, changement de bucket)
-            // produisent des "vitesses infinies" et flaggeraient ~tout le serveur.
-            // La position reste capturée + affichée dans le panel (info), mais ne
-            // flag plus. Activable à chaud via le panel (champ "Max téléports").
-            pos_jump_max: AtomicU32::new(0),
+            pos_osc_dist: AtomicU32::new(300),
+            // Oscillation OFF par défaut (activable au panel) : un admin qui se
+            // tp en boucle entre 2 spots en parlant pourrait matcher. Le suivi
+            // (colonne Oscill.) reste affiché pour calibrer avant d'activer.
+            pos_osc_max: AtomicU32::new(0),
+            // Incohérence position↔cibles ON par défaut : triple garde (cibles
+            // proximité uniquement, positions fraîches, mutualité basse exigée)
+            // → une foule, un respawn ou le téléphone ne peuvent pas la déclencher.
+            pos_far_dist: AtomicU32::new(500),
+            pos_far_min: AtomicU32::new(5),
+            pos_far_pct: AtomicU32::new(70),
             action: AtomicU8::new(action),
             webhook: Mutex::new(webhook.filter(|s| !s.is_empty())),
             panel_url: Mutex::new(panel_url.filter(|s| !s.is_empty())),
@@ -290,7 +313,9 @@ impl AnticheatConfig {
     }
 
     /// Hot path voix : la position 3D du joueur (si le framework l'envoie).
-    /// Détecte les téléports impossibles (spoof de position) sur des dt courts.
+    /// Suit les "lieux" visités et compte les RETOURS vers un lieu antérieur
+    /// lointain (oscillation A→B→A→B = spoof multi-positions). Un téléport
+    /// légitime (respawn, interior, bucket) est un aller simple : 0 retour.
     pub fn note_position(&self, client: &ClientArc, x: f32, y: f32, z: f32) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
@@ -299,8 +324,8 @@ impl AnticheatConfig {
         let had = client.ac_has_pos.swap(true, Ordering::Relaxed);
         if had {
             let dt = now.duration_since(client.ac_last_pos_time.load()).as_secs_f32();
-            // dt court uniquement : un gros écart = "pas parlé un moment" (ou tp
-            // légitime), pas un spoof. Un spoof cycle sa position à ~50 paquets/s.
+            // Vitesse max sur dt court : info panel uniquement (les tp légitimes
+            // FiveM rendent la vitesse inexploitable comme signal — prouvé en prod).
             if dt > 0.0 && dt < 0.5 {
                 let dx = x - client.ac_pos_x.load(Ordering::Relaxed);
                 let dy = y - client.ac_pos_y.load(Ordering::Relaxed);
@@ -309,15 +334,43 @@ impl AnticheatConfig {
                 if speed > client.ac_max_speed.load(Ordering::Relaxed) {
                     client.ac_max_speed.store(speed, Ordering::Relaxed);
                 }
-                if speed > self.pos_speed_max.load(Ordering::Relaxed) as f32 {
-                    client.ac_pos_jumps.fetch_add(1, Ordering::Relaxed);
-                }
             }
         }
         client.ac_pos_x.store(x, Ordering::Relaxed);
         client.ac_pos_y.store(y, Ordering::Relaxed);
         client.ac_pos_z.store(z, Ordering::Relaxed);
         client.ac_last_pos_time.store(now);
+
+        // Suivi des lieux : on n'enregistre une ancre que si on s'est éloigné de
+        // plus de pos_osc_dist du dernier lieu (lock pris seulement dans ce cas
+        // rare, jamais pendant une conversation immobile).
+        let osc_dist = self.pos_osc_dist.load(Ordering::Relaxed) as f32;
+        if osc_dist <= 0.0 {
+            return;
+        }
+        let mut hist = client.ac_pos_hist.lock();
+        let moved = match hist.back() {
+            Some(&(_, ax, ay, az, _)) => {
+                let d2 = (x - ax) * (x - ax) + (y - ay) * (y - ay) + (z - az) * (z - az);
+                d2 > osc_dist * osc_dist
+            }
+            None => true,
+        };
+        if moved {
+            // Retour = on ré-atterrit près d'un lieu déjà visité dans la fenêtre.
+            // (Jamais le lieu précédent : on vient d'en partir de > osc_dist.)
+            let rr = (osc_dist * 0.5) * (osc_dist * 0.5);
+            let is_return = hist.iter().any(|&(_, hx, hy, hz, _)| {
+                (x - hx) * (x - hx) + (y - hy) * (y - hy) + (z - hz) * (z - hz) < rr
+            });
+            hist.push_back((now, x, y, z, is_return));
+            while hist.len() > POS_HIST_CAP {
+                hist.pop_front();
+            }
+            hist.retain(|&(t, ..)| now.duration_since(t) <= POS_OSC_WINDOW);
+            let returns = hist.iter().filter(|&&(.., r)| r).count() as u32;
+            client.ac_pos_jumps.store(returns, Ordering::Relaxed);
+        }
     }
 
     /// Évaluation périodique de TOUS les clients. Calcule, par client :
@@ -400,9 +453,32 @@ impl AnticheatConfig {
         let mutuality_max = self.mutuality_max_pct.load(Ordering::Relaxed);
         let strikes_required = self.strikes_required.load(Ordering::Relaxed).max(1);
         let listen_max = self.listen_max.load(Ordering::Relaxed);
-        let pos_jump_max = self.pos_jump_max.load(Ordering::Relaxed);
+        let pos_osc_max = self.pos_osc_max.load(Ordering::Relaxed);
+        let pos_far_dist = self.pos_far_dist.load(Ordering::Relaxed) as f32;
+        let pos_far_min = self.pos_far_min.load(Ordering::Relaxed);
+        let pos_far_pct = self.pos_far_pct.load(Ordering::Relaxed);
 
-        for s in &snaps {
+        // Position fraîche de chaque client (None = pas d'émission récente ou
+        // framework en volume-override : position inexploitable, on s'abstient).
+        let pos_of: Vec<Option<(f32, f32, f32)>> = snaps
+            .iter()
+            .map(|s| {
+                let c = &s.c;
+                if c.ac_has_pos.load(Ordering::Relaxed)
+                    && now.duration_since(c.ac_last_pos_time.load()) <= POS_FRESH
+                {
+                    Some((
+                        c.ac_pos_x.load(Ordering::Relaxed),
+                        c.ac_pos_y.load(Ordering::Relaxed),
+                        c.ac_pos_z.load(Ordering::Relaxed),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (my_idx, s) in snaps.iter().enumerate() {
             let c = &s.c;
             let my_session = c.session_id;
 
@@ -413,11 +489,16 @@ impl AnticheatConfig {
                     reached.insert(sess);
                 }
             }
+            // Cibles PROXIMITÉ (channels), gardées à part : elles seules sont
+            // soumises au contrôle de distance (les sessions = téléphone/radio,
+            // légitimement longue distance, en sont exclues).
+            let mut reached_chan: HashSet<u32> = HashSet::new();
             for &ch in &s.chans {
                 if let Some(list) = chan_members.get(&ch) {
                     for &sess in list {
                         if sess != my_session {
                             reached.insert(sess);
+                            reached_chan.insert(sess);
                         }
                     }
                 }
@@ -452,19 +533,62 @@ impl AnticheatConfig {
 
             let listens = *listen_count.get(&my_session).unwrap_or(&0);
 
+            // Incohérence position↔cibles : parmi mes cibles proximité à position
+            // fraîche, combien sont hors de portée de MA position déclarée ?
+            // Physiquement impossible en proximité légitime (<100 m) — et le
+            // cheater ne peut pas l'éviter : ses cibles sont partout sur la map.
+            let (far, fresh_total) = match pos_of[my_idx] {
+                Some((sx, sy, sz)) => {
+                    let mut far = 0u32;
+                    let mut tot = 0u32;
+                    for &r in &reached_chan {
+                        if let Some(&idx) = sess_to_idx.get(&r) {
+                            if let Some((qx, qy, qz)) = pos_of[idx] {
+                                tot += 1;
+                                let d2 = (sx - qx) * (sx - qx)
+                                    + (sy - qy) * (sy - qy)
+                                    + (sz - qz) * (sz - qz);
+                                if d2 > pos_far_dist * pos_far_dist {
+                                    far += 1;
+                                }
+                            }
+                        }
+                    }
+                    (far, tot)
+                }
+                None => (0, 0),
+            };
+            c.ac_far_targets.store(far, Ordering::Relaxed);
+
+            // Oscillations : ré-expire la fenêtre même si le joueur ne pose plus
+            // de nouvelle ancre (sinon le compteur resterait figé).
+            let pos_osc = {
+                let mut hist = c.ac_pos_hist.lock();
+                hist.retain(|&(t, ..)| now.duration_since(t) <= POS_OSC_WINDOW);
+                let returns = hist.iter().filter(|&&(.., r)| r).count() as u32;
+                c.ac_pos_jumps.store(returns, Ordering::Relaxed);
+                returns
+            };
+
             c.ac_reach_instant.store(reach_instant, Ordering::Relaxed);
             c.ac_reach_window.store(window_reach, Ordering::Relaxed);
             c.ac_mutuality.store(mutuality, Ordering::Relaxed);
             c.ac_listen_count.store(listens, Ordering::Relaxed);
 
             // Conditions de suspicion.
-            let pos_jumps = c.ac_pos_jumps.load(Ordering::Relaxed);
+            let low_mutuality = mutuality != 255 && mutuality <= mutuality_max;
             let high_reach = reach >= min_recipients && (reach as u64) * 100 >= (active as u64) * (threshold_pct as u64);
-            let talk_cheat = high_reach && mutuality != 255 && mutuality <= mutuality_max;
+            let talk_cheat = high_reach && low_mutuality;
             let spy = listen_max > 0 && listens > listen_max;
-            let pos_spoof = pos_jump_max > 0 && pos_jumps > pos_jump_max;
+            let pos_spoof = pos_osc_max > 0 && pos_osc >= pos_osc_max;
+            // Doublement gardée : position incohérente ET mutualité basse (une
+            // foule légitime ou un framework mono-channel restent mutuels).
+            let pos_far_cheat = pos_far_min > 0
+                && far >= pos_far_min
+                && far * 100 >= fresh_total * pos_far_pct.min(100).max(1)
+                && low_mutuality;
 
-            if talk_cheat || spy || pos_spoof {
+            if talk_cheat || spy || pos_spoof || pos_far_cheat {
                 let strikes = c.ac_strikes.fetch_add(1, Ordering::Relaxed) + 1;
                 if strikes >= strikes_required {
                     let mut parts: Vec<&str> = Vec::new();
@@ -475,10 +599,13 @@ impl AnticheatConfig {
                         parts.push("listen map-wide (espionnage)");
                     }
                     if pos_spoof {
-                        parts.push("spoof position (téléports)");
+                        parts.push("spoof position (oscillation multi-lieux)");
+                    }
+                    if pos_far_cheat {
+                        parts.push("cibles hors de portée (position incohérente)");
                     }
                     let reason = parts.join(" + ");
-                    let metric = reach.max(listens).max(pos_jumps);
+                    let metric = reach.max(listens).max(far).max(pos_osc);
                     c.ac_score.fetch_add(metric as u64, Ordering::Relaxed);
                     self.flag(state, c, reach, listens, active, mutuality, &reason);
                 }
