@@ -852,9 +852,11 @@ impl AnticheatConfig {
                         "color": 15158332u32,
                         // Affiché par Discord dans le fuseau du lecteur.
                         "timestamp": iso8601_now(),
+                        // Pas d'IP dans l'embed : les webhooks peuvent partir dans
+                        // les Discord des staffs de serveurs — l'IP reste visible
+                        // uniquement sur le panel (avec le toggle "Cacher les IP").
                         "fields": [
                             {"name": "Joueur", "value": client.get_name().to_string(), "inline": true},
-                            {"name": "IP", "value": client.peer_ip.to_string(), "inline": true},
                             {"name": "Client", "value": client.version_release.clone(), "inline": true},
                             {"name": "Raison", "value": reason},
                             {"name": "Portée / Mutualité", "value": format!("{}/{} joueurs, mut {}", reach, active, mut_s), "inline": true},
