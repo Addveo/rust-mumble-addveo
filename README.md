@@ -58,6 +58,10 @@ docker run -d --name mumble_monserveur --restart unless-stopped \
 | `--http-password` | mot de passe du panel ET de l'API admin (FiveM `mumble_api` l'utilise aussi) |
 | `--server-name` | affiché en haut du panel + dans les embeds Discord (fini les serveurs anonymes) |
 
+> **Vous donnez le panel à des utilisateurs/staffs ?** Ajoutez **`--panel-hide-ips`** :
+> toutes les IP joueur sont expurgées côté serveur (API comprise, pas seulement
+> l'affichage), et ce n'est pas désactivable depuis le panel.
+
 ---
 
 ## ⚙️ Tous les paramètres anticheat (défauts recommandés)
@@ -75,7 +79,7 @@ docker run -d --name mumble_monserveur --restart unless-stopped \
 | `--anticheat-strikes` | 3 | Cycles suspects consécutifs avant d'agir (anti faux positif) |
 | `--anticheat-listen-max` | 25 | Écouter plus de X channels = espionnage map-wide (0 = off) |
 | `--ban-file` | — | JSON des bans/mutes persistants (mettre sur un volume) |
-| `--anticheat-webhook` | — | Webhook Discord notifié à chaque détection (avec date/heure) |
+| `--anticheat-webhook` | — | Webhook Discord notifié à chaque détection (embeds horodatés — date/heure/secondes — et **sans IP joueur**, partageables à un staff) |
 | `--anticheat-panel-url` | — | URL du panel mise dans l'embed Discord (lien direct) |
 | `--server-name` | adresse | Nom lisible du serveur (panel + Discord) |
 | `--panel-hide-ips` | off | **Expurge TOUTES les IP côté serveur** (API HTTP + panel) — indispensable si vous donnez le panel à des utilisateurs. Le serveur continue de bannir par IP en interne |
@@ -84,11 +88,25 @@ docker run -d --name mumble_monserveur --restart unless-stopped \
 
 ### Le panel
 
-- **Tableau live** des joueurs (2s) : portée, mutualité, listens, position, score, flags — triable par colonne, recherche (nom/IP/session), paginé par 100.
-- **Clic sur un nom** → « qui lui a parlé » (dernière heure, persisté) — idéal pour identifier le harceleur d'un streamer : videz la liste, le prochain qui parle est le suspect.
+- **Tableau live** des joueurs (2s) : portée, mutualité, listens, position, score, flags — triable par colonne, recherche (nom/IP/session), paginé par 100 (fluide même à 2000 joueurs). Nom du serveur dans la barre du haut.
+- **Clic sur un nom** → « qui lui a parlé » (dernière heure, persistée sur disque : survit aux redémarrages ET à la déco du cheater ; un deco/reco met juste sa ligne à jour) — idéal pour identifier le harceleur d'un streamer : videz la liste, le prochain qui parle est le suspect.
 - **Actions par joueur** : Bloquer (mute persistant), Débloquer (+exempt), Kick, BAN, Reset.
-- **Config à chaud** : tous les seuils, l'action, le webhook, sans redémarrage.
-- **« Cacher les IP »** : masque toutes les IP pour partager l'écran.
+- **Config à chaud** : tous les seuils, l'action, le webhook, sans redémarrage — plus **Clear compteurs/logs** pour repartir de zéro après calibration.
+- **« Cacher les IP »** : masque les IP à l'affichage pour partager l'écran. Pour un masquage **garanti** (utilisateurs finaux), utilisez `--panel-hide-ips` côté serveur.
+
+### API HTTP (auth basic `admin` / `--http-password`)
+
+| Endpoint | Rôle |
+|---|---|
+| `GET /panel` | Le panel web |
+| `GET /anticheat` | État complet JSON (config, joueurs+métriques, logs, bans) |
+| `POST /anticheat/config` | Modifier la config à chaud (mêmes champs que le panel) |
+| `POST /anticheat/user` | `{user, action}` — `block` / `unblock` / `kick` / `ban` / `reset` |
+| `POST /anticheat/unban` | `{id}` — retire une entrée de la ban-list |
+| `POST /anticheat/clear` | Remet à zéro compteurs de tous les joueurs + logs (config et bans intacts) |
+| `GET /anticheat/heard/:session` | Qui a parlé à ce joueur (nom, dernière fois, secondes cumulées) |
+| `POST /anticheat/heard/:session/clear` | Vide la liste « qui lui a parlé » de ce joueur |
+| `GET /status`, `GET /metrics`, `POST /mute`, `POST /deaf` | Endpoints upstream (natives FiveM, Prometheus) |
 
 ---
 
