@@ -290,6 +290,11 @@ pub struct AnticheatConfig {
     pub pos_far_pct: AtomicU32,
     /// Rétention (secondes) de la mémoire « qui a parlé à ce joueur » du panel.
     pub heard_secs: AtomicU32,
+    /// Masquage FORCÉ des IP côté serveur (--panel-hide-ips) : aucune IP ne
+    /// sort par l'API HTTP (panel donné à des utilisateurs finaux). Le serveur
+    /// continue de banner/matcher par IP en interne. Volontairement ABSENT de
+    /// l'API de config : non débrayable à chaud par un utilisateur du panel.
+    pub hide_ips: AtomicBool,
     /// Fichier de persistance de « qui a parlé » (snapshot 60 s, volume /data).
     pub heard_file: Mutex<Option<PathBuf>>,
     /// Listes rechargées du disque, en attente de la reconnexion de leur
@@ -351,6 +356,7 @@ impl AnticheatConfig {
             // La RAM reste bornée par HEARD_CAP (64 émetteurs/joueur), pas par
             // la durée — seule la taille du snapshot JSON varie (négligeable).
             heard_secs: AtomicU32::new(3600),
+            hide_ips: AtomicBool::new(false),
             heard_file: Mutex::new(None),
             heard_seed: Mutex::new(HashMap::new()),
             action: AtomicU8::new(action),

@@ -78,6 +78,7 @@ docker run -d --name mumble_monserveur --restart unless-stopped \
 | `--anticheat-webhook` | — | Webhook Discord notifié à chaque détection (avec date/heure) |
 | `--anticheat-panel-url` | — | URL du panel mise dans l'embed Discord (lien direct) |
 | `--server-name` | adresse | Nom lisible du serveur (panel + Discord) |
+| `--panel-hide-ips` | off | **Expurge TOUTES les IP côté serveur** (API HTTP + panel) — indispensable si vous donnez le panel à des utilisateurs. Le serveur continue de bannir par IP en interne |
 
 **Conseil de mise en route** : lancez en `--anticheat-action log` une soirée, regardez les logs du panel/Discord. Les vrais cheats map-wide (mutualité ~0% avec 100+ joueurs atteints) se détectent sans faux positif. Quand c'est propre → passez `mute` ou `ban` dans le panel, sans redémarrer.
 

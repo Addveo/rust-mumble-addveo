@@ -129,6 +129,11 @@ struct Args {
     /// and in the Discord embeds. Defaults to the listen address.
     #[clap(long, value_parser, default_value = None)]
     server_name: Option<String>,
+    /// Never expose player IPs over the HTTP api/panel (server-side redaction,
+    /// not toggleable at runtime) — for panels handed to end users. The server
+    /// still bans/matches by IP internally.
+    #[clap(long)]
+    panel_hide_ips: bool,
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -182,6 +187,7 @@ async fn main() {
         args.anticheat_panel_url.clone(),
         args.server_name.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| args.listen.clone()),
     );
+    anticheat.hide_ips.store(args.panel_hide_ips, std::sync::atomic::Ordering::Relaxed);
 
     if args.anticheat {
         tracing::info!(

@@ -12,6 +12,9 @@ use crate::anticheat::{action_name, parse_action};
 use crate::client::ClientArc;
 use crate::error::DisconnectReason;
 
+/// Valeur renvoyée à la place de TOUTE IP quand --panel-hide-ips est actif.
+const IP_REDACTED: &str = "xx.xx.xx.xx";
+
 #[derive(Serialize)]
 pub struct AnticheatClient {
     pub session_id: u32,
@@ -57,6 +60,8 @@ pub struct AnticheatStatus {
     pub pos_far_pct: u32,
     pub heard_secs: u32,
     pub server_label: String,
+    /// true = --panel-hide-ips : toutes les IP de cette réponse sont expurgées.
+    pub hide_ips: bool,
     pub action: &'static str,
     pub webhook: Option<String>,
     pub panel_url: Option<String>,
@@ -68,6 +73,9 @@ pub struct AnticheatStatus {
 
 pub async fn get_anticheat(State(state): State<AppStateRef>) -> Json<AnticheatStatus> {
     let ac = &state.server.anticheat;
+    // Redaction CÔTÉ SERVEUR : quand --panel-hide-ips est actif, aucune IP ne
+    // quitte le processus (le JSON brut est propre, pas seulement l'affichage).
+    let hide_ips = ac.hide_ips.load(Ordering::Relaxed);
 
     let mut clients = Vec::new();
     let mut iter = state.server.clients.first_entry_async().await;
@@ -76,7 +84,7 @@ pub async fn get_anticheat(State(state): State<AppStateRef>) -> Json<AnticheatSt
         clients.push(AnticheatClient {
             session_id: client.session_id,
             name: client.get_name().as_ref().clone(),
-            ip: client.peer_ip.to_string(),
+            ip: if hide_ips { IP_REDACTED.to_string() } else { client.peer_ip.to_string() },
             version: client.version_str.clone(),
             release: client.version_release.clone(),
             os: client.version_os.clone(),
@@ -102,6 +110,15 @@ pub async fn get_anticheat(State(state): State<AppStateRef>) -> Json<AnticheatSt
 
     clients.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(b.reach_window.cmp(&a.reach_window)));
 
+    let mut bans = state.server.bans.list();
+    if hide_ips {
+        for b in &mut bans {
+            if b.ip.is_some() {
+                b.ip = Some(IP_REDACTED.to_string());
+            }
+        }
+    }
+
     Json(AnticheatStatus {
         enabled: ac.enabled.load(Ordering::Relaxed),
         threshold_pct: ac.threshold_pct.load(Ordering::Relaxed),
@@ -117,13 +134,14 @@ pub async fn get_anticheat(State(state): State<AppStateRef>) -> Json<AnticheatSt
         pos_far_pct: ac.pos_far_pct.load(Ordering::Relaxed),
         heard_secs: ac.heard_secs.load(Ordering::Relaxed),
         server_label: ac.server_label.clone(),
+        hide_ips,
         action: action_name(ac.action.load(Ordering::Relaxed)),
         webhook: ac.webhook.lock().clone(),
         panel_url: ac.panel_url.lock().clone(),
         connected: state.server.active_clients.load(Ordering::Relaxed),
         clients,
         logs: ac.recent_logs(),
-        bans: state.server.bans.list(),
+        bans,
     })
 }
 
@@ -336,6 +354,7 @@ pub async fn get_heard(
         return Err(StatusCode::NOT_FOUND);
     };
     let client = entry.get();
+    let hide_ips = state.server.anticheat.hide_ips.load(Ordering::Relaxed);
     let retention_secs = state.server.anticheat.heard_secs.load(Ordering::Relaxed);
     let retention = std::time::Duration::from_secs(retention_secs.max(10) as u64);
     let now = std::time::Instant::now();
@@ -346,7 +365,7 @@ pub async fn get_heard(
             .map(|e| HeardItem {
                 session_id: e.session_id,
                 name: e.name.clone(),
-                ip: e.ip.clone(),
+                ip: if hide_ips { IP_REDACTED.to_string() } else { e.ip.clone() },
                 ago_secs: now.duration_since(e.last).as_secs(),
                 secs: e.secs,
             })
@@ -431,7 +450,7 @@ pre { background: #fafafa; }
 <div class="flex items-center gap-3 bg-black text-white rounded-xl px-4 py-2" style="flex:0 0 auto; background:#111; color:#fff; border-radius:12px;">
 <span class="text-lg font-extrabold tracking-tight" style="font-weight:800; font-size:18px;">Addveo</span>
 <span class="text-xs opacity-60" style="font-size:12px; opacity:.6;">Anticheat Mumble</span>
-<label class="ml-auto flex items-center gap-1.5 text-xs cursor-pointer select-none" style="margin-left:auto; cursor:pointer; font-size:12px; display:flex; align-items:center; gap:5px;">
+<label id="hideipslabel" class="ml-auto flex items-center gap-1.5 text-xs cursor-pointer select-none" style="margin-left:auto; cursor:pointer; font-size:12px; display:flex; align-items:center; gap:5px;">
 <input type="checkbox" id="hideips" onchange="toggleIps(this.checked)"> Cacher les IP
 </label>
 <span id="serverlabel" class="font-bold text-sm" style="font-weight:700; font-size:14px;"></span>
@@ -730,6 +749,11 @@ async function load() {
     lastData = d;
     document.getElementById('serverlabel').textContent = d.server_label || '';
     document.title = 'Anticheat — ' + (d.server_label || 'Mumble');
+    if (d.hide_ips) {
+        // --panel-hide-ips : les IP sont déjà expurgées CÔTÉ SERVEUR, le
+        // toggle local n'a plus de sens (et ne pourrait rien révéler).
+        document.getElementById('hideipslabel').style.display = 'none';
+    }
     renderClients();
     loadHeard();
     renderLogs();
