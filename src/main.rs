@@ -125,6 +125,10 @@ struct Args {
     /// Anticheat: this server's panel URL (e.g. http://1.2.3.4:13000/panel), put in the Discord embed to identify/open the server that flagged.
     #[clap(long, value_parser, default_value = None)]
     anticheat_panel_url: Option<String>,
+    /// Human-readable server name (e.g. "FRATWORLD"), shown on the panel header
+    /// and in the Discord embeds. Defaults to the listen address.
+    #[clap(long, value_parser, default_value = None)]
+    server_name: Option<String>,
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -176,7 +180,7 @@ async fn main() {
         crate::anticheat::parse_action(&args.anticheat_action),
         args.anticheat_webhook.clone(),
         args.anticheat_panel_url.clone(),
-        args.listen.clone(),
+        args.server_name.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| args.listen.clone()),
     );
 
     if args.anticheat {

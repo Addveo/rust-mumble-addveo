@@ -56,6 +56,7 @@ pub struct AnticheatStatus {
     pub pos_far_min: u32,
     pub pos_far_pct: u32,
     pub heard_secs: u32,
+    pub server_label: String,
     pub action: &'static str,
     pub webhook: Option<String>,
     pub panel_url: Option<String>,
@@ -115,6 +116,7 @@ pub async fn get_anticheat(State(state): State<AppStateRef>) -> Json<AnticheatSt
         pos_far_min: ac.pos_far_min.load(Ordering::Relaxed),
         pos_far_pct: ac.pos_far_pct.load(Ordering::Relaxed),
         heard_secs: ac.heard_secs.load(Ordering::Relaxed),
+        server_label: ac.server_label.clone(),
         action: action_name(ac.action.load(Ordering::Relaxed)),
         webhook: ac.webhook.lock().clone(),
         panel_url: ac.panel_url.lock().clone(),
@@ -395,19 +397,29 @@ pub async fn get_panel() -> Html<&'static str> {
 const PANEL_HTML: &str = r#"<!doctype html>
 <html lang="fr">
 <body>
+<script src="https://cdn.tailwindcss.com"></script>
 <style>
 html, body { height: 100%; margin: 0; }
-body { display: flex; flex-direction: column; overflow: hidden; box-sizing: border-box; padding: 8px; gap: 6px; font-family: sans-serif; }
-fieldset { flex: 0 0 auto; }
+body { display: flex; flex-direction: column; overflow: hidden; box-sizing: border-box; padding: 10px; gap: 8px; font-family: ui-sans-serif, system-ui, sans-serif; background: #fff; color: #111; }
+fieldset { flex: 0 0 auto; border: 1px solid #111; border-radius: 12px; font-size: 12px; }
+legend { font-weight: 700; padding: 0 6px; }
+button { border: 1px solid #111; background: #fff; color: #111; padding: 2px 10px; border-radius: 8px; font-size: 12px; cursor: pointer; transition: background .1s, color .1s; }
+button:hover { background: #111; color: #fff; }
+input, select { border: 1px solid #111; border-radius: 8px; padding: 2px 6px; font-size: 12px; background: #fff; color: #111; }
+table { border-collapse: collapse; }
+th, td { border: 1px solid #e5e5e5; padding: 3px 7px; }
+pre { background: #fafafa; }
 #controls { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 #main { display: flex; gap: 14px; flex: 1 1 auto; min-height: 0; }
 #left { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-#tablewrap { flex: 1 1 auto; overflow: auto; min-height: 0; border: 1px solid #888; }
-#tablewrap table { border-collapse: collapse; width: 100%; font-size: 13px; }
-#tablewrap thead th { position: sticky; top: 0; background: #e8e8e8; z-index: 1; box-shadow: 0 1px 0 #888; }
+#tablewrap { flex: 1 1 auto; overflow: auto; min-height: 0; border: 1px solid #111; border-radius: 10px; }
+#tablewrap table { width: 100%; font-size: 13px; }
+#tablewrap thead th { position: sticky; top: 0; background: #111; color: #fff; border-color: #111; z-index: 1; }
+#tablewrap tbody tr:nth-child(even) { background: #f7f7f7; }
+#tablewrap tbody tr:hover { background: #ececec; }
 #right { width: 440px; flex: 0 0 auto; overflow-y: auto; min-height: 0; }
 #heardwrap { max-height: 260px; overflow: auto; }
-#heardwrap thead th { position: sticky; top: 0; background: #e8e8e8; box-shadow: 0 1px 0 #888; }
+#heardwrap thead th, #right thead th { position: sticky; top: 0; background: #111; color: #fff; border-color: #111; }
 @media (max-width: 1100px) {
   body { overflow: auto; }
   #main { flex-direction: column; }
@@ -415,6 +427,15 @@ fieldset { flex: 0 0 auto; }
   #tablewrap { max-height: 60vh; }
 }
 </style>
+
+<div class="flex items-center gap-3 bg-black text-white rounded-xl px-4 py-2" style="flex:0 0 auto; background:#111; color:#fff; border-radius:12px;">
+<span class="text-lg font-extrabold tracking-tight" style="font-weight:800; font-size:18px;">Addveo</span>
+<span class="text-xs opacity-60" style="font-size:12px; opacity:.6;">Anticheat Mumble</span>
+<label class="ml-auto flex items-center gap-1.5 text-xs cursor-pointer select-none" style="margin-left:auto; cursor:pointer; font-size:12px; display:flex; align-items:center; gap:5px;">
+<input type="checkbox" id="hideips" onchange="toggleIps(this.checked)"> Cacher les IP
+</label>
+<span id="serverlabel" class="font-bold text-sm" style="font-weight:700; font-size:14px;"></span>
+</div>
 
 <fieldset>
 <legend>Configuration</legend>
@@ -437,6 +458,7 @@ fieldset { flex: 0 0 auto; }
 <option value="log">log</option>
 <option value="mute">mute</option>
 <option value="kick">kick</option>
+<option value="ban">ban (persistant)</option>
 </select>
 </label>
 <button onclick="applyConfig()">Appliquer</button>
@@ -523,6 +545,22 @@ let sortKey = 'score', sortDir = -1, lastData = null;
 let searchQ = '';
 let page = 0;
 const PAGE_SIZE = 100;
+let hideIps = false;
+try { hideIps = localStorage.getItem('ac_hideips') === '1'; } catch (e) {}
+
+// Masque toutes les IP (v4) — pour montrer le panel sans exposer les joueurs.
+function maskIp(s) {
+    return hideIps ? String(s).replace(/\b\d{1,3}(\.\d{1,3}){3}\b/g, 'xx.xx.xx.xx') : s;
+}
+
+function toggleIps(v) {
+    hideIps = v;
+    try { localStorage.setItem('ac_hideips', v ? '1' : '0'); } catch (e) {}
+    renderClients();
+    renderLogs();
+    renderBans();
+    loadHeard();
+}
 
 function onSearch(v) {
     searchQ = v.trim().toLowerCase();
@@ -584,7 +622,7 @@ function renderClients() {
         const mut = c.mutuality === 255 ? '-' : (c.mutuality + '%');
         const pos = c.has_pos ? (Math.round(c.pos_x) + ',' + Math.round(c.pos_y) + ',' + Math.round(c.pos_z)) : '-';
         const spd = c.has_pos ? Math.round(c.max_speed) : '-';
-        const cells = [c.session_id, c.name, c.ip, c.release, c.channel_id, c.reach_instant, c.reach_window, mut, c.listens, pos, spd, c.pos_jumps, c.far_targets, c.score, c.flags,
+        const cells = [c.session_id, c.name, maskIp(c.ip), c.release, c.channel_id, c.reach_instant, c.reach_window, mut, c.listens, pos, spd, c.pos_jumps, c.far_targets, c.score, c.flags,
                        c.muted ? 'OUI' : 'non', c.exempt ? 'OUI' : 'non'];
         cells.forEach((v, i) => {
             const td = document.createElement('td');
@@ -652,7 +690,7 @@ async function loadHeard() {
     tb.innerHTML = '';
     for (const h of d.heard) {
         const tr = document.createElement('tr');
-        for (const v of [h.session_id, h.name, h.ip, h.ago_secs + 's', h.secs]) {
+        for (const v of [h.session_id, h.name, maskIp(h.ip), h.ago_secs + 's', h.secs]) {
             const td = document.createElement('td');
             td.textContent = v;
             tr.appendChild(td);
@@ -690,17 +728,27 @@ async function load() {
     }
 
     lastData = d;
+    document.getElementById('serverlabel').textContent = d.server_label || '';
+    document.title = 'Anticheat — ' + (d.server_label || 'Mumble');
     renderClients();
     loadHeard();
+    renderLogs();
+    renderBans();
+}
 
+function renderLogs() {
+    if (!lastData) return;
     document.getElementById('logs').textContent =
-        d.logs && d.logs.length ? d.logs.join('\n') : '(aucune détection pour le moment)';
+        lastData.logs && lastData.logs.length ? maskIp(lastData.logs.join('\n')) : '(aucune détection pour le moment)';
+}
 
+function renderBans() {
+    if (!lastData) return;
     const bans = document.getElementById('bans');
     bans.innerHTML = '';
-    for (const b of (d.bans || [])) {
+    for (const b of (lastData.bans || [])) {
         const tr = document.createElement('tr');
-        for (const v of [b.display, b.ip || '-', b.at]) {
+        for (const v of [b.display, maskIp(b.ip || '-'), b.at]) {
             const td = document.createElement('td');
             td.textContent = v;
             tr.appendChild(td);
@@ -779,6 +827,7 @@ async function userAction(user, action) {
     load();
 }
 
+document.getElementById('hideips').checked = hideIps;
 buildHead();
 load();
 setInterval(load, 2000);

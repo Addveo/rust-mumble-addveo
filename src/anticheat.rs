@@ -144,6 +144,8 @@ const FLAG_COOLDOWN: Duration = Duration::from_secs(3);
 pub const ACTION_LOG: u8 = 0;
 pub const ACTION_MUTE: u8 = 1;
 pub const ACTION_KICK: u8 = 2;
+/// Ban PERSISTANT (IP+nom, comme le bouton BAN du panel) + déconnexion.
+pub const ACTION_BAN: u8 = 3;
 
 /// Clés pour la fenêtre glissante : on distingue un id de channel d'un id de
 /// session pour compter des cibles distinctes sans collision.
@@ -159,10 +161,38 @@ fn hms_now() -> String {
     format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
 }
 
+/// Date-heure UTC au format ISO 8601 (ex. 2026-07-10T18:10:42Z) — utilisée
+/// comme `timestamp` des embeds Discord (affichée dans le fuseau du lecteur).
+fn iso8601_now() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let (y, m, d) = civil_from_days((secs / 86400) as i64);
+    let rem = secs % 86400;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60
+    )
+}
+
+/// Jours depuis l'epoch → (année, mois, jour) — algorithme "civil_from_days"
+/// de Howard Hinnant, évite d'embarquer chrono pour trois embeds.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 pub fn parse_action(action: &str) -> u8 {
     match action {
         "mute" => ACTION_MUTE,
         "kick" => ACTION_KICK,
+        "ban" => ACTION_BAN,
         _ => ACTION_LOG,
     }
 }
@@ -171,6 +201,7 @@ pub fn action_name(action: u8) -> &'static str {
     match action {
         ACTION_MUTE => "mute",
         ACTION_KICK => "kick",
+        ACTION_BAN => "ban",
         _ => "log",
     }
 }
@@ -819,6 +850,8 @@ impl AnticheatConfig {
                     "embeds": [{
                         "title": "🚨 Détection anticheat",
                         "color": 15158332u32,
+                        // Affiché par Discord dans le fuseau du lecteur.
+                        "timestamp": iso8601_now(),
                         "fields": [
                             {"name": "Joueur", "value": client.get_name().to_string(), "inline": true},
                             {"name": "IP", "value": client.peer_ip.to_string(), "inline": true},
@@ -826,6 +859,8 @@ impl AnticheatConfig {
                             {"name": "Raison", "value": reason},
                             {"name": "Portée / Mutualité", "value": format!("{}/{} joueurs, mut {}", reach, active, mut_s), "inline": true},
                             {"name": "Listens / Score", "value": format!("{} / {}", listens, score), "inline": true},
+                            {"name": "Action", "value": format!("{}{}", action_name(action), if exempt { " (exempt)" } else { "" }), "inline": true},
+                            {"name": "Date (UTC)", "value": format!("{} {}", iso8601_now().split('T').next().unwrap_or(""), hms_now()), "inline": true},
                             {"name": "Serveur", "value": server_field}
                         ]
                     }]
@@ -841,6 +876,18 @@ impl AnticheatConfig {
         match action {
             ACTION_MUTE => client.set_mute(true),
             ACTION_KICK => state.add_client_to_disconnect_queue(client.session_id, DisconnectReason::Anticheat),
+            ACTION_BAN => {
+                // Ban persistant (IP+nom, comme le bouton BAN du panel) puis
+                // déconnexion — la reconnexion est refusée à l'entrée (tcp.rs).
+                state.bans.add(
+                    "ban",
+                    Some(client.peer_ip.to_string()),
+                    Some(name_part(client.get_name().as_str())),
+                    client.get_name().to_string(),
+                    format!("ban auto anticheat : {}", reason),
+                );
+                state.add_client_to_disconnect_queue(client.session_id, DisconnectReason::Anticheat);
+            }
             _ => {}
         }
     }
