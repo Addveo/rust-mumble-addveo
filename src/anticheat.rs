@@ -217,8 +217,10 @@ const POS_HIST_CAP: usize = 16;
 const POS_FRESH: Duration = Duration::from_secs(10);
 
 /// Cap dur d'émetteurs mémorisés par joueur pour « qui lui a parlé » —
-/// borne stricte de mémoire (~100 octets/entrée → ≤ ~6 Ko par joueur).
-const HEARD_CAP: usize = 64;
+/// borne stricte de mémoire (~150 octets/entrée → ≤ ~40 Ko/joueur, ~20 Mo
+/// pour 500 joueurs). 64 saturait sur les serveurs très denses (500+ joueurs)
+/// : la proximité remplissait la liste et évinçait un harceleur intermittent.
+const HEARD_CAP: usize = 256;
 /// Snapshot disque de la mémoire « qui a parlé » tous les N cycles du sampler
 /// (30 × 2 s = 60 s) — jamais sur le chemin voix.
 const HEARD_FLUSH_EVERY: u32 = 30;
@@ -352,10 +354,11 @@ impl AnticheatConfig {
             pos_far_dist: AtomicU32::new(500),
             pos_far_min: AtomicU32::new(15),
             pos_far_pct: AtomicU32::new(70),
-            // 1 h : large pour qu'un streamer signale le harcèlement après coup.
-            // La RAM reste bornée par HEARD_CAP (64 émetteurs/joueur), pas par
-            // la durée — seule la taille du snapshot JSON varie (négligeable).
-            heard_secs: AtomicU32::new(3600),
+            // 15 min : fenêtre pour repérer un harceleur EN COURS ou tout juste
+            // parti. 1 h saturait la liste sur un serveur dense (accumulation de
+            // proximity speakers qui n'expiraient jamais → le cheater se faisait
+            // évincer « au bout d'un moment »). Réglable à chaud jusqu'à 2 h.
+            heard_secs: AtomicU32::new(900),
             hide_ips: AtomicBool::new(false),
             heard_file: Mutex::new(None),
             heard_seed: Mutex::new(HashMap::new()),

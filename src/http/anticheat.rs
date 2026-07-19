@@ -800,7 +800,7 @@ function resetConfig() {
     document.getElementById('pos_far_min').value = 15;
     document.getElementById('pos_far_dist').value = 500;
     document.getElementById('pos_far_pct').value = 70;
-    document.getElementById('heard_secs').value = 3600;
+    document.getElementById('heard_secs').value = 900;
     document.getElementById('action').value = 'log';
     applyConfig();
 }
